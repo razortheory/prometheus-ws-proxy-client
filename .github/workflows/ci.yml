@@ -1,0 +1,102 @@
+name: CI
+
+"on":
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  ASSET_NAME: proxy-client-linux-amd64
+  BINARY_NAME: proxy-client
+
+jobs:
+  quality:
+    name: Rust 1.96 quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.96
+        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy
+      - name: Check formatting
+        run: cargo +1.96.0 fmt --all -- --check
+      - name: Run tests
+        run: cargo +1.96.0 test --locked --all-targets --all-features
+      - name: Run Clippy
+        run: cargo +1.96.0 clippy --locked --all-targets --all-features -- -D warnings
+
+  msrv:
+    name: Rust 1.88 MSRV
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.88
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Check all targets
+        run: cargo +1.88.0 check --locked --all-targets --all-features
+      - name: Test all targets
+        run: cargo +1.88.0 test --locked --all-targets --all-features
+
+  static-amd64:
+    name: Static Linux amd64
+    needs: [quality, msrv]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Build static artifact
+        run: >-
+          docker buildx build
+          --platform linux/amd64
+          --target artifact
+          --output type=local,dest=dist
+          .
+      - name: Verify artifact
+        run: |
+          set -euo pipefail
+          artifact="dist/${ASSET_NAME}"
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          description="$(file "$artifact")"
+          echo "$description"
+          grep -Eq 'ELF 64-bit.*x86-64' <<<"$description"
+          grep -Eq 'statically linked|static-pie linked' <<<"$description"
+          grep -q 'stripped' <<<"$description"
+          if readelf -l "$artifact" | grep -q 'INTERP'; then
+            echo "unexpected ELF interpreter" >&2
+            exit 1
+          fi
+          if readelf -d "$artifact" | grep -q '(NEEDED)'; then
+            echo "unexpected dynamic dependency" >&2
+            exit 1
+          fi
+          "$artifact" --version | grep -Fq " $version"
+      - name: Smoke test oldest target userspace
+        run: |
+          set -euo pipefail
+          output="$(docker run --rm --pull=always --platform linux/amd64 \
+            --volume "$PWD/dist/${ASSET_NAME}:/usr/local/bin/${BINARY_NAME}:ro" \
+            ubuntu:16.04 "/usr/local/bin/${BINARY_NAME}" --version)"
+          echo "$output"
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          grep -Fq " $version" <<<"$output"

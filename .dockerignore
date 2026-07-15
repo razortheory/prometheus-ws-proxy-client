@@ -1,4 +1,7 @@
-target/*
-output/*
-docker/*
-config.json
+.git
+.github
+target
+dist
+output
+docker
+.DS_Store

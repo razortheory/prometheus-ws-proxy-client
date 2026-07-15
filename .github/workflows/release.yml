@@ -1,31 +1,161 @@
-# .github/workflows/release.yml
+name: Release
 
-on:
-  release:
-    types: [created]
+"on":
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  PACKAGE_NAME: proxy-client
+  BINARY_NAME: proxy-client
+  ASSET_NAME: proxy-client-linux-amd64
 
 jobs:
-  release:
-    name: release ubuntu-${{ matrix.ubuntu_version }} rust-${{ matrix.rust_version }}
-    runs-on: ubuntu-latest
+  build:
+    name: Build and verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.96
+        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy
+      - name: Install Rust 1.88 MSRV
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Match tag to Cargo version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          package_version="$(cargo +1.96.0 metadata --locked --no-deps --format-version 1 \
+            | jq -r --arg package "$PACKAGE_NAME" '.packages[] | select(.name == $package) | .version')"
+          if [[ -z "$package_version" || "$RELEASE_TAG" != "v${package_version}" ]]; then
+            echo "tag ${RELEASE_TAG} does not match ${PACKAGE_NAME} version ${package_version}" >&2
+            exit 1
+          fi
+          echo "PACKAGE_VERSION=${package_version}" >> "$GITHUB_ENV"
+      - name: Check formatting
+        run: cargo +1.96.0 fmt --all -- --check
+      - name: Run tests
+        run: cargo +1.96.0 test --locked --all-targets --all-features
+      - name: Run Clippy
+        run: cargo +1.96.0 clippy --locked --all-targets --all-features -- -D warnings
+      - name: Check MSRV
+        run: cargo +1.88.0 check --locked --all-targets --all-features
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Build static artifact
+        run: >-
+          docker buildx build
+          --platform linux/amd64
+          --target artifact
+          --output type=local,dest=dist
+          .
+      - name: Verify artifact and checksum
+        run: |
+          set -euo pipefail
+          artifact="dist/${ASSET_NAME}"
+          chmod 0755 "$artifact"
+          description="$(file "$artifact")"
+          echo "$description"
+          grep -Eq 'ELF 64-bit.*x86-64' <<<"$description"
+          grep -Eq 'statically linked|static-pie linked' <<<"$description"
+          grep -q 'stripped' <<<"$description"
+          if readelf -l "$artifact" | grep -q 'INTERP'; then
+            echo "unexpected ELF interpreter" >&2
+            exit 1
+          fi
+          if readelf -d "$artifact" | grep -q '(NEEDED)'; then
+            echo "unexpected dynamic dependency" >&2
+            exit 1
+          fi
+          "$artifact" --version | grep -Fq " ${PACKAGE_VERSION}"
+          (
+            cd dist
+            sha256sum "$ASSET_NAME" > "${ASSET_NAME}.sha256"
+            sha256sum --check "${ASSET_NAME}.sha256"
+          )
+      - name: Upload verified release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets
+          path: |
+            dist/${{ env.ASSET_NAME }}
+            dist/${{ env.ASSET_NAME }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  smoke:
+    name: Ubuntu ${{ matrix.ubuntu }} userspace
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - rust_version: 1.77
-        ubuntu_version: [ 22.04, 20.04, 18.04, 16.04 ]
+        ubuntu: ["16.04", "18.04", "20.04", "22.04", "24.04", "26.04"]
     steps:
-      - uses: actions/checkout@master
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Build
-        run: docker buildx build --build-arg="RUST_VERSION=${{ matrix.rust_version }}" --build-arg="UBUNTU_VERSION=${{ matrix.ubuntu_version }}" --platform=linux/amd64 -f ./docker/Dockerfile --output=. --target=output .
-      - name: Rename binary
-        run: mv output/proxy-client output/proxy-client-ubuntu-${{ matrix.ubuntu_version }}
-      - name: Release
-        uses: softprops/action-gh-release@v2
+      - name: Download verified release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          files: output/*
-          token: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          name: release-assets
+          path: dist
+      - name: Verify checksum and run binary
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          UBUNTU_VERSION: ${{ matrix.ubuntu }}
+        run: |
+          set -euo pipefail
+          (
+            cd dist
+            sha256sum --check "${ASSET_NAME}.sha256"
+          )
+          chmod 0755 "dist/${ASSET_NAME}"
+          output="$(docker run --rm --pull=always --platform linux/amd64 \
+            --volume "$PWD/dist/${ASSET_NAME}:/usr/local/bin/${BINARY_NAME}:ro" \
+            "ubuntu:${UBUNTU_VERSION}" "/usr/local/bin/${BINARY_NAME}" --version)"
+          echo "$output"
+          grep -Fq " ${RELEASE_TAG#v}" <<<"$output"
+
+  publish:
+    name: Publish GitHub release
+    needs: smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: dist
+      - name: Publish verified release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          (
+            cd dist
+            sha256sum --check "${ASSET_NAME}.sha256"
+          )
+          gh release create "$RELEASE_TAG" \
+            "dist/${ASSET_NAME}" \
+            "dist/${ASSET_NAME}.sha256" \
+            --verify-tag \
+            --generate-notes \
+            --title "$RELEASE_TAG"

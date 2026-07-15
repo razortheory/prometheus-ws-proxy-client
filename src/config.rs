@@ -1,87 +1,213 @@
-use crate::utils::get_ec2_instance_name;
-use serde::{de, Deserialize};
+use crate::BoxError;
+use reqwest::header::HeaderValue;
+use serde::Deserialize;
 use std::collections::HashMap;
-use std::error::Error;
-use std::fs::File;
-use std::io::BufReader;
+use std::fmt;
 use std::path::Path;
 
-fn default_empty_string() -> String {
-    "".to_string()
-}
+const DEFAULT_EC2_METADATA_DOMAIN: &str = "http://169.254.169.254";
 
-fn default_false() -> bool {
-    false
-}
-
-fn deserialize_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
-where
-    D: de::Deserializer<'de>,
-{
-    let v: bool = de::Deserialize::deserialize(deserializer)?;
-    Ok(v)
-}
-
-fn ec2_meta_domain() -> String {
-    "http://169.254.169.254".to_string()
-}
-
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Clone, Deserialize)]
 pub struct Config {
-    instance: String,
+    pub instance: String,
     pub target: String,
     pub resources: HashMap<String, String>,
-    #[serde(deserialize_with = "deserialize_bool", default = "default_false")]
+    #[serde(default)]
     pub cf_access_enabled: bool,
-    #[serde(default = "default_empty_string")]
+    #[serde(default)]
     pub cf_access_key: String,
-    #[serde(default = "default_empty_string")]
+    #[serde(default)]
     pub cf_access_secret: String,
-    #[serde(default = "ec2_meta_domain")]
-    ec2_meta_domain: String
+    #[serde(default = "default_ec2_metadata_domain")]
+    pub ec2_meta_domain: String,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Config")
+            .field("instance", &self.instance)
+            .field("target", &self.target)
+            .field("resources", &self.resources.keys().collect::<Vec<_>>())
+            .field("cf_access_enabled", &self.cf_access_enabled)
+            .field("cf_access_key", &"[redacted]")
+            .field("cf_access_secret", &"[redacted]")
+            .field("ec2_meta_domain", &self.ec2_meta_domain)
+            .finish()
+    }
+}
+
+fn default_ec2_metadata_domain() -> String {
+    DEFAULT_EC2_METADATA_DOMAIN.to_owned()
 }
 
 impl Config {
-    #[cfg(test)]
-    pub fn new(
-        instance: String,
-        target: String,
-        resources: HashMap<String, String>,
-        cf_access_enabled: bool,
-        cf_access_key: String,
-        cf_access_secret: String,
-        ec2_meta_domain: String,
-    ) -> Config {
-        let mut c = Config {
-            instance: "".to_string(),
-            target,
-            resources,
-            cf_access_enabled,
-            cf_access_key,
-            cf_access_secret,
-            ec2_meta_domain,
-        };
-        c.set_instance_name(instance);
-        c
+    pub async fn load(path: &Path, metadata_client: &reqwest::Client) -> Result<Self, BoxError> {
+        let contents = tokio::fs::read(path).await?;
+        let mut config: Self = serde_json::from_slice(&contents)?;
+        config.resolve_instance(metadata_client).await?;
+        Ok(config)
     }
 
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Config, Box<dyn Error>> {
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
-        let mut c: Config = serde_json::from_reader(reader)?;
-        c.set_instance_name(c.instance.clone());
-        Ok(c)
+    pub async fn from_json(
+        contents: &[u8],
+        metadata_client: &reqwest::Client,
+    ) -> Result<Self, BoxError> {
+        let mut config: Self = serde_json::from_slice(contents)?;
+        config.resolve_instance(metadata_client).await?;
+        Ok(config)
     }
 
-    pub fn get_instance_name(&self) -> &String {
-        &self.instance
-    }
-
-    pub fn set_instance_name(&mut self, value: String) {
-        let mut instance_name = value;
-        if instance_name == "ec2" {
-            instance_name = get_ec2_instance_name(&self.ec2_meta_domain)
+    async fn resolve_instance(&mut self, client: &reqwest::Client) -> Result<(), BoxError> {
+        if self.instance != "ec2" {
+            return Ok(());
         }
-        self.instance = instance_name;
+
+        let base = self.ec2_meta_domain.trim_end_matches('/');
+        let token_url = format!("{base}/latest/api/token");
+        let instance_url = format!("{base}/latest/meta-data/instance-id");
+
+        let token = client
+            .put(token_url)
+            .header("X-aws-ec2-metadata-token-ttl-seconds", "21600")
+            .send()
+            .await
+            .ok()
+            .filter(|response| response.status().is_success());
+
+        let token = match token {
+            Some(response) => response.text().await.ok().filter(|value| !value.is_empty()),
+            None => None,
+        };
+
+        let mut request = client.get(&instance_url);
+        if let Some(token) = token.as_ref() {
+            request = request.header("X-aws-ec2-metadata-token", HeaderValue::from_str(token)?);
+        }
+
+        let mut response = request.send().await?;
+        if !response.status().is_success() && token.is_some() {
+            response = client.get(&instance_url).send().await?;
+        }
+        if !response.status().is_success() {
+            return Err(format!(
+                "EC2 metadata returned status {} while resolving instance",
+                response.status()
+            )
+            .into());
+        }
+
+        let instance = response.text().await?;
+        let instance = instance.trim();
+        if instance.is_empty() {
+            return Err("EC2 metadata returned an empty instance id".into());
+        }
+        self.instance = instance.to_owned();
+        Ok(())
+    }
+}
+
+pub fn metadata_client() -> Result<reqwest::Client, reqwest::Error> {
+    crate::install_rustls_provider();
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::{get, put};
+    use axum::Router;
+    use std::sync::{Arc, Mutex};
+
+    async fn test_server(app: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}")
+    }
+
+    fn client() -> reqwest::Client {
+        crate::install_rustls_provider();
+        reqwest::Client::new()
+    }
+
+    #[tokio::test]
+    async fn applies_defaults_for_static_instance() {
+        let client = client();
+        let config = Config::from_json(
+            br#"{"instance":"host","target":"https://example.test/proxy/","resources":{}}"#,
+            &client,
+        )
+        .await
+        .unwrap();
+        assert_eq!(config.instance, "host");
+        assert!(!config.cf_access_enabled);
+        assert_eq!(config.cf_access_key, "");
+        assert_eq!(config.cf_access_secret, "");
+    }
+
+    #[tokio::test]
+    async fn resolves_ec2_once_with_imdsv2() {
+        let token_headers = Arc::new(Mutex::new(Vec::<HeaderMap>::new()));
+        let app = Router::new()
+            .route("/latest/api/token", put(|| async { "token" }))
+            .route(
+                "/latest/meta-data/instance-id",
+                get(
+                    |State(headers): State<Arc<Mutex<Vec<HeaderMap>>>>,
+                     request_headers: HeaderMap| async move {
+                        headers.lock().unwrap().push(request_headers.clone());
+                        if request_headers
+                            .get("X-aws-ec2-metadata-token")
+                            .and_then(|value| value.to_str().ok())
+                            == Some("token")
+                        {
+                            (StatusCode::OK, "i-test")
+                        } else {
+                            (StatusCode::UNAUTHORIZED, "missing token")
+                        }
+                    },
+                ),
+            )
+            .with_state(token_headers.clone());
+        let domain = test_server(app).await;
+        let json = format!(
+            r#"{{"instance":"ec2","target":"http://example.test/","resources":{{}},"ec2_meta_domain":"{domain}"}}"#
+        );
+        crate::install_rustls_provider();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let config = Config::from_json(json.as_bytes(), &client).await.unwrap();
+        assert_eq!(config.instance, "i-test");
+        assert_eq!(token_headers.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_imdsv1() {
+        let app = Router::new()
+            .route(
+                "/latest/api/token",
+                put(|| async { (StatusCode::NOT_FOUND, "") }),
+            )
+            .route(
+                "/latest/meta-data/instance-id",
+                get(|headers: HeaderMap| async move {
+                    assert!(headers.get("X-aws-ec2-metadata-token").is_none());
+                    "i-v1"
+                }),
+            );
+        let domain = test_server(app).await;
+        let json = format!(
+            r#"{{"instance":"ec2","target":"http://example.test/","resources":{{}},"ec2_meta_domain":"{domain}"}}"#
+        );
+        let config = Config::from_json(json.as_bytes(), &client()).await.unwrap();
+        assert_eq!(config.instance, "i-v1");
     }
 }
