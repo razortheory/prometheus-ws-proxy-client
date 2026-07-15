@@ -15,6 +15,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
+  SCCACHE_GHA_ENABLED: "true"
   PACKAGE_NAME: proxy-client
   BINARY_NAME: proxy-client
   ASSET_NAME: proxy-client-linux-amd64
@@ -33,6 +34,10 @@ jobs:
         run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy
       - name: Install Rust 1.88 MSRV
         run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          version: v0.16.0
       - name: Match tag to Cargo version
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -60,6 +65,8 @@ jobs:
           docker buildx build
           --platform linux/amd64
           --target artifact
+          --secret id=actions_results_url,env=ACTIONS_RESULTS_URL
+          --secret id=actions_runtime_token,env=ACTIONS_RUNTIME_TOKEN
           --output type=local,dest=dist
           .
       - name: Verify artifact and checksum

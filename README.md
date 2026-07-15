@@ -133,6 +133,9 @@ Choose `--parallel` from expected scrape concurrency. Adding workers increases c
 ## Build and test from source
 
 Rust 1.96 is pinned for normal development. The declared minimum supported Rust version is 1.88.
+Cargo uses `sccache` through `.cargo/config.toml`, so install sccache 0.16.0 and
+keep it on `PATH` before running the commands below. Local Cargo builds share
+the user's normal sccache store; GitHub Actions uses its cache backend.
 
 ```bash
 cargo +1.96.0 fmt --all -- --check
@@ -147,9 +150,14 @@ Build the release artifact exactly as CI does:
 docker buildx build \
   --platform linux/amd64 \
   --target artifact \
+  --secret id=actions_results_url,env=ACTIONS_RESULTS_URL \
+  --secret id=actions_runtime_token,env=ACTIONS_RUNTIME_TOKEN \
   --output type=local,dest=dist \
   .
 ```
+
+The BuildKit secrets are optional when those environment variables are unset.
+Docker builds then fall back to the builder's shared local sccache mount.
 
 ## Releases and Ubuntu support
 
