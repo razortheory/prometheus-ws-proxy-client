@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod config;
+pub mod memory;
 pub mod protocol;
 pub mod resource;
 pub mod target;

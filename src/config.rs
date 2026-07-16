@@ -46,6 +46,7 @@ impl Config {
         let contents = tokio::fs::read(path).await?;
         let mut config: Self = serde_json::from_slice(&contents)?;
         config.resolve_instance(metadata_client).await?;
+        config.validate_protocol_identifiers()?;
         Ok(config)
     }
 
@@ -55,7 +56,16 @@ impl Config {
     ) -> Result<Self, BoxError> {
         let mut config: Self = serde_json::from_slice(contents)?;
         config.resolve_instance(metadata_client).await?;
+        config.validate_protocol_identifiers()?;
         Ok(config)
+    }
+
+    fn validate_protocol_identifiers(&self) -> Result<(), BoxError> {
+        crate::protocol::validate_instance(&self.instance)?;
+        for resource in self.resources.keys() {
+            crate::protocol::validate_resource(resource)?;
+        }
+        Ok(())
     }
 
     async fn resolve_instance(&mut self, client: &reqwest::Client) -> Result<(), BoxError> {
@@ -149,6 +159,33 @@ mod tests {
         assert!(!config.cf_access_enabled);
         assert_eq!(config.cf_access_key, "");
         assert_eq!(config.cf_access_secret, "");
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_protocol_identifiers() {
+        let oversized_instance = "i".repeat(257);
+        let instance_json = serde_json::json!({
+            "instance": oversized_instance,
+            "target": "https://example.test/proxy/",
+            "resources": {}
+        });
+        assert!(
+            Config::from_json(instance_json.to_string().as_bytes(), &client())
+                .await
+                .is_err()
+        );
+
+        let oversized_resource = "r".repeat(513);
+        let resource_json = serde_json::json!({
+            "instance": "host",
+            "target": "https://example.test/proxy/",
+            "resources": { oversized_resource: "http://127.0.0.1:9100/metrics" }
+        });
+        assert!(
+            Config::from_json(resource_json.to_string().as_bytes(), &client())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 use clap::Parser;
 use proxy_client::cli::Cli;
 use proxy_client::config::{metadata_client, Config};
+use proxy_client::memory::{MemoryBudget, DEFAULT_MEMORY_BUDGET_SIZE};
 use proxy_client::resource::shared_http_client;
 use proxy_client::target::Target;
 use proxy_client::worker::{run_worker, WorkerContext};
@@ -63,6 +64,7 @@ async fn main() -> Result<(), BoxError> {
         target,
         client,
         protocol: cli.protocol,
+        memory_budget: MemoryBudget::new(DEFAULT_MEMORY_BUDGET_SIZE),
     };
 
     let shutdown = CancellationToken::new();

@@ -38,7 +38,7 @@ Wire v3 uses an HTTP response POST and falls back to a WebSocket response when t
 Releases contain one stripped, static Linux amd64 binary and its checksum. Pin a version in automation:
 
 ```bash
-VERSION=v3.0.0
+VERSION=v3.0.1
 BASE="https://github.com/roman-karpovich/prometheus-ws-proxy-client/releases/download/${VERSION}"
 curl -fLO "${BASE}/proxy-client-linux-amd64"
 curl -fLO "${BASE}/proxy-client-linux-amd64.sha256"
@@ -161,7 +161,7 @@ Docker builds then fall back to the builder's shared local sccache mount.
 
 ## Releases and Ubuntu support
 
-Pushing a tag such as `v3.0.0` starts the release workflow. The tag must exactly match the Cargo package version. CI builds one static `proxy-client-linux-amd64`, verifies that it has no ELF interpreter or dynamic dependencies, creates a SHA-256 file, and runs that same artifact in Ubuntu 16.04, 18.04, 20.04, 22.04, 24.04, and 26.04 containers before publishing it.
+Pushing a tag such as `v3.0.1` starts the release workflow. The tag must exactly match the Cargo package version. CI builds one static `proxy-client-linux-amd64`, verifies that it has no ELF interpreter or dynamic dependencies, creates a SHA-256 file, and runs that same artifact in Ubuntu 16.04, 18.04, 20.04, 22.04, 24.04, and 26.04 containers before publishing it.
 
 Container smoke tests verify each Ubuntu userspace, not its historical kernel. In particular, Ubuntu 16.04 normally runs kernel 4.4 while GitHub and Docker hosts use a newer kernel. Treat Ubuntu 16 support as provisional until the artifact has also run on a real Ubuntu 16 host or VM.
 

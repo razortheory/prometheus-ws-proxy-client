@@ -53,6 +53,7 @@ impl Target {
     }
 
     pub fn response_url(&self, uid: &str) -> Result<Url, BoxError> {
+        crate::protocol::validate_uid(uid)?;
         let mut result = self.response_base.clone();
         result
             .path_segments_mut()
@@ -121,6 +122,12 @@ mod tests {
             target.response_url("id/with space").unwrap().as_str(),
             "https://example.test/a/response/id%2Fwith%20space/"
         );
+    }
+
+    #[test]
+    fn response_url_rejects_oversized_uid_before_percent_encoding() {
+        let target = Target::parse("https://example.test/a/").unwrap();
+        assert!(target.response_url(&"u".repeat(129)).is_err());
     }
 
     #[test]

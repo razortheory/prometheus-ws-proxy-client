@@ -1,14 +1,15 @@
 use crate::config::Config;
+use crate::memory::{BudgetedResponse, MemoryBudget, MemoryReservation};
 use crate::protocol::{
-    ready_json, register_json, response_json, IncomingMessage, ResourceResponse, PING_JSON,
-    PONG_JSON,
+    ready_json, register_json, response_form_encoded_len, response_json, response_json_encoded_len,
+    IncomingMessage, ResourceResponse, PING_JSON, PONG_JSON,
 };
 use crate::resource::call_resource;
 use crate::target::Target;
 use crate::{BoxError, MAX_WS_MESSAGE_SIZE};
 use futures_util::stream::FuturesUnordered;
 use futures_util::{Sink, SinkExt, StreamExt};
-use reqwest::header::HeaderValue as ReqwestHeaderValue;
+use reqwest::header::{HeaderValue as ReqwestHeaderValue, CONTENT_TYPE};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -40,10 +41,11 @@ pub struct WorkerContext {
     pub target: Target,
     pub client: Arc<reqwest::Client>,
     pub protocol: u8,
+    pub memory_budget: MemoryBudget,
 }
 
 struct Completion {
-    response: ResourceResponse,
+    response: Option<BudgetedResponse>,
     delivered_by_http: bool,
 }
 
@@ -68,6 +70,8 @@ pub async fn run_connection(
     context: &WorkerContext,
     shutdown: &CancellationToken,
 ) -> Result<(), BoxError> {
+    crate::protocol::validate_instance(&context.config.instance)?;
+    crate::protocol::validate_worker(worker_name)?;
     let mut request = context.target.ws_url().as_str().into_client_request()?;
     add_websocket_cf_headers(request.headers_mut(), &context.config)?;
 
@@ -93,9 +97,9 @@ pub async fn run_connection(
 
     let (completion_tx, mut completion_rx) = mpsc::channel::<Completion>(1);
     let (busy_response_tx, busy_response_rx) =
-        mpsc::channel::<ResourceResponse>(BUSY_RESPONSE_QUEUE_CAPACITY);
+        mpsc::channel::<BudgetedResponse>(BUSY_RESPONSE_QUEUE_CAPACITY);
     let (busy_fallback_tx, mut busy_fallback_rx) =
-        mpsc::channel::<ResourceResponse>(BUSY_RESPONSE_QUEUE_CAPACITY);
+        mpsc::channel::<BudgetedResponse>(BUSY_RESPONSE_QUEUE_CAPACITY);
     let busy_response_actor = tokio::spawn(run_busy_response_actor(
         context.clone(),
         busy_response_rx,
@@ -107,8 +111,9 @@ pub async fn run_connection(
     heartbeat.tick().await;
     let mut last_pong = Instant::now();
 
-    let result = loop {
-        tokio::select! {
+    let result = async {
+        loop {
+            tokio::select! {
             () = shutdown.cancelled() => {
                 let _ = send_ws(&mut write, Message::Close(None)).await;
                 break Ok(());
@@ -128,22 +133,16 @@ pub async fn run_connection(
                     task.await?;
                 }
                 if !completion.delivered_by_http {
-                    send_ws(
-                        &mut write,
-                        Message::Text(bounded_response_json(&completion.response)?.into()),
-                    )
-                    .await?;
+                    if let Some(response) = completion.response {
+                        send_response_ws(&mut write, &context.memory_budget, response).await?;
+                    }
                 }
             }
             fallback = busy_fallback_rx.recv() => {
                 let Some(fallback) = fallback else {
                     break Err("busy response actor closed unexpectedly".into());
                 };
-                send_ws(
-                    &mut write,
-                    Message::Text(bounded_response_json(&fallback)?.into()),
-                )
-                .await?;
+                send_response_ws(&mut write, &context.memory_budget, fallback).await?;
             }
             message = read.next() => {
                 let Some(message) = message else {
@@ -158,6 +157,10 @@ pub async fn run_connection(
                                 continue;
                             }
                         };
+                        if let Err(error) = incoming.validate() {
+                            tracing::warn!(error = %error, "ignored websocket message with oversized identifier");
+                            continue;
+                        }
                         match incoming {
                             IncomingMessage::Ping => {
                                 send_ws(&mut write, Message::Text(PONG_JSON.into())).await?;
@@ -177,20 +180,33 @@ pub async fn run_connection(
                             IncomingMessage::Request { uid, resource } => {
                                 if active_task.is_some() {
                                     tracing::warn!("rejected a second request while worker is busy");
-                                    let busy = ResourceResponse::new(uid, 503, String::new());
+                                    let busy = match BudgetedResponse::try_new(
+                                        &context.memory_budget,
+                                        uid,
+                                        503,
+                                        String::new(),
+                                    ) {
+                                        Ok(busy) => busy,
+                                        Err(error) => {
+                                            tracing::warn!(error = %error, "busy response rejected by memory budget");
+                                            continue;
+                                        }
+                                    };
                                     if context.protocol == 3 {
                                         if let Err(error) = busy_response_tx.try_send(busy) {
                                             let busy = error.into_inner();
-                                            send_ws(
+                                            send_response_ws(
                                                 &mut write,
-                                                Message::Text(bounded_response_json(&busy)?.into()),
+                                                &context.memory_budget,
+                                                busy,
                                             )
                                             .await?;
                                         }
                                     } else {
-                                        send_ws(
+                                        send_response_ws(
                                             &mut write,
-                                            Message::Text(bounded_response_json(&busy)?.into()),
+                                            &context.memory_budget,
+                                            busy,
                                         )
                                         .await?;
                                     }
@@ -205,15 +221,19 @@ pub async fn run_connection(
                                         &task_context.config,
                                         uid,
                                         &resource,
+                                        &task_context.memory_budget,
                                     )
                                     .await;
                                     let delivered_by_http = if task_context.protocol == 3 {
-                                        match post_response(&task_context, &response).await {
-                                            Ok(()) => true,
-                                            Err(error) => {
-                                                tracing::warn!(error = %error, "unable to deliver v3 response; falling back to websocket");
-                                                false
+                                        match response.as_ref() {
+                                            Some(response) => match post_response(&task_context, response).await {
+                                                Ok(()) => true,
+                                                Err(error) => {
+                                                    tracing::warn!(error = %error, "unable to deliver v3 response; falling back to websocket");
+                                                    false
+                                                }
                                             }
+                                            None => false,
                                         }
                                     } else {
                                         false
@@ -242,8 +262,10 @@ pub async fn run_connection(
                     }
                 }
             }
+            }
         }
-    };
+    }
+    .await;
 
     if let Some(task) = active_task {
         task.abort();
@@ -256,8 +278,8 @@ pub async fn run_connection(
 
 async fn run_busy_response_actor(
     context: WorkerContext,
-    mut responses: mpsc::Receiver<ResourceResponse>,
-    fallbacks: mpsc::Sender<ResourceResponse>,
+    mut responses: mpsc::Receiver<BudgetedResponse>,
+    fallbacks: mpsc::Sender<BudgetedResponse>,
 ) -> Result<(), BoxError> {
     let mut posts = FuturesUnordered::new();
     let mut input_open = true;
@@ -315,26 +337,78 @@ where
         .map_err(|error| Box::new(error) as BoxError)
 }
 
-fn bounded_response_json(response: &ResourceResponse) -> Result<String, BoxError> {
-    bounded_response_json_with_limit(response, MAX_WS_MESSAGE_SIZE)
+async fn send_response_ws<S>(
+    sink: &mut S,
+    memory_budget: &MemoryBudget,
+    mut response: BudgetedResponse,
+) -> Result<(), BoxError>
+where
+    S: Sink<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let encoded = bounded_response_json(&mut response, memory_budget)?;
+    let EncodedResponse { json, reservation } = encoded;
+    let result = send_ws(sink, Message::Text(json.into())).await;
+    drop(reservation);
+    result
 }
 
-fn bounded_response_json_with_limit(
-    response: &ResourceResponse,
-    limit: usize,
-) -> Result<String, BoxError> {
-    let json = response_json(response)?;
-    if json.len() <= limit {
-        return Ok(json);
-    }
+struct EncodedResponse {
+    json: String,
+    reservation: MemoryReservation,
+}
 
-    let fallback = ResourceResponse::new(response.uid.clone(), 500, String::new());
-    let json = response_json(&fallback)?;
-    if json.len() <= limit {
-        Ok(json)
+fn bounded_response_json(
+    response: &mut BudgetedResponse,
+    memory_budget: &MemoryBudget,
+) -> Result<EncodedResponse, BoxError> {
+    bounded_response_json_with_limit_and_encoder(
+        response,
+        memory_budget,
+        MAX_WS_MESSAGE_SIZE,
+        response_json,
+    )
+}
+
+fn bounded_response_json_with_limit_and_encoder<F>(
+    response: &mut BudgetedResponse,
+    memory_budget: &MemoryBudget,
+    limit: usize,
+    encoder: F,
+) -> Result<EncodedResponse, BoxError>
+where
+    F: FnOnce(&ResourceResponse) -> serde_json::Result<String>,
+{
+    let original_length = response_json_encoded_len(response)
+        .ok_or("websocket response length calculation overflowed")?;
+    let reservation = if original_length <= limit {
+        memory_budget.try_reserve(original_length).ok()
     } else {
-        Err("websocket response metadata exceeds the message limit".into())
+        None
+    };
+
+    let (encoded_length, mut reservation) = match reservation {
+        Some(reservation) => (original_length, reservation),
+        None => {
+            response.downgrade_to_error();
+            let fallback_length = response_json_encoded_len(response)
+                .ok_or("websocket fallback length calculation overflowed")?;
+            if fallback_length > limit {
+                return Err("websocket response metadata exceeds the message limit".into());
+            }
+            let reservation = memory_budget.try_reserve(fallback_length)?;
+            (fallback_length, reservation)
+        }
+    };
+
+    let json = encoder(response)?;
+    if json.len() != encoded_length {
+        return Err("websocket response length precheck disagreed with serializer".into());
     }
+    if json.capacity() > encoded_length {
+        reservation.try_grow(json.capacity() - encoded_length)?;
+    }
+    Ok(EncodedResponse { json, reservation })
 }
 
 fn add_websocket_cf_headers(
@@ -356,14 +430,54 @@ fn add_websocket_cf_headers(
 
 async fn post_response(
     context: &WorkerContext,
-    response: &ResourceResponse,
+    response: &BudgetedResponse,
 ) -> Result<(), BoxError> {
+    let prepared = prepare_form_request(context, response)?;
+    let PreparedFormRequest {
+        request,
+        reservation,
+    } = prepared;
+    let result = request.send().await?.error_for_status().map(|_| ());
+    drop(reservation);
+    result.map_err(|error| Box::new(error) as BoxError)
+}
+
+struct PreparedFormRequest {
+    request: reqwest::RequestBuilder,
+    reservation: MemoryReservation,
+}
+
+fn prepare_form_request(
+    context: &WorkerContext,
+    response: &BudgetedResponse,
+) -> Result<PreparedFormRequest, BoxError> {
+    prepare_form_request_with_encoder(context, response, encode_form)
+}
+
+fn prepare_form_request_with_encoder<F>(
+    context: &WorkerContext,
+    response: &BudgetedResponse,
+    encoder: F,
+) -> Result<PreparedFormRequest, BoxError>
+where
+    F: FnOnce(&ResourceResponse, usize) -> Result<String, BoxError>,
+{
+    let encoded_length =
+        response_form_encoded_len(response).ok_or("form response length calculation overflowed")?;
+    let mut reservation = context.memory_budget.try_reserve(encoded_length)?;
+    let form = encoder(response, encoded_length)?;
+    if form.len() != encoded_length {
+        return Err("form response length precheck disagreed with serializer".into());
+    }
+    if form.capacity() > encoded_length {
+        reservation.try_grow(form.capacity() - encoded_length)?;
+    }
     let url = context.target.response_url(&response.uid)?;
-    let status = response.status.to_string();
-    let mut request = context.client.post(url).form(&[
-        ("status", status.as_str()),
-        ("body", response.body.as_str()),
-    ]);
+    let mut request = context
+        .client
+        .post(url)
+        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(form);
     if context.config.cf_access_enabled {
         request = request
             .header(
@@ -375,14 +489,26 @@ async fn post_response(
                 ReqwestHeaderValue::from_str(&context.config.cf_access_secret)?,
             );
     }
-    request.send().await?.error_for_status()?;
-    Ok(())
+    Ok(PreparedFormRequest {
+        request,
+        reservation,
+    })
+}
+
+fn encode_form(response: &ResourceResponse, encoded_length: usize) -> Result<String, BoxError> {
+    let status = response.status.to_string();
+    let mut serializer =
+        url::form_urlencoded::Serializer::new(String::with_capacity(encoded_length));
+    serializer.append_pair("status", &status);
+    serializer.append_pair("body", &response.body);
+    Ok(serializer.finish())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{run_connection, WorkerContext, CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET};
     use crate::config::Config;
+    use crate::memory::{BudgetedResponse, MemoryBudget};
     use crate::target::Target;
     use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
     use axum::extract::{Form, Path, State};
@@ -392,6 +518,7 @@ mod tests {
     use axum::Router;
     use futures_util::StreamExt;
     use serde_json::{json, Value};
+    use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -591,6 +718,7 @@ mod tests {
             target: Target::parse(&format!("{base}/proxy/")).unwrap(),
             client: Arc::new(reqwest::Client::new()),
             protocol,
+            memory_budget: MemoryBudget::new(crate::memory::DEFAULT_MEMORY_BUDGET_SIZE),
         }
     }
 
@@ -734,6 +862,46 @@ mod tests {
             assert!(
                 !matches!(event, Event::HttpResponse { .. } | Event::WsResponse(_)),
                 "duplicate response event: {event:?}"
+            );
+        }
+        cancellation.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_busy_uid_is_ignored_before_queue_or_post() {
+        let oversized_uid = "u".repeat(129);
+        let (base, mut events, exporter_stats) =
+            start_server_with_requests(3, false, &["request-1", &oversized_uid]).await;
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn({
+            let context = context(&base, 3, false);
+            let cancellation = cancellation.clone();
+            async move { run_connection("worker-3", &context, &cancellation).await }
+        });
+
+        let _ = take_register(&mut events).await;
+        let _ = take_ready(&mut events).await;
+        let mut pong_seen = false;
+        let response_uid = loop {
+            match recv_event(&mut events).await {
+                Event::Pong => pong_seen = true,
+                Event::HttpResponse { uid, .. } => break uid,
+                Event::WsResponse(response) => {
+                    panic!("unexpected WS response for oversized UID: {response}")
+                }
+                event => panic!("unexpected event: {event:?}"),
+            }
+        };
+
+        assert_eq!(response_uid, "request-1");
+        assert!(pong_seen);
+        assert_eq!(exporter_stats.calls.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, Event::HttpResponse { .. } | Event::WsResponse(_)),
+                "oversized UID produced a response: {event:?}"
             );
         }
         cancellation.cancel();
@@ -886,16 +1054,97 @@ mod tests {
 
     #[test]
     fn oversized_serialized_ws_body_becomes_bounded_500() {
-        let response = crate::protocol::ResourceResponse::new(
+        let raw_response = crate::protocol::ResourceResponse::new(
             "uid".into(),
             200,
             "\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\".into(),
         );
-        let json = super::bounded_response_json_with_limit(&response, 64).unwrap();
-        let value: Value = serde_json::from_str(&json).unwrap();
+        let budget = MemoryBudget::new(128);
+        let mut response = BudgetedResponse::try_new(
+            &budget,
+            raw_response.uid,
+            raw_response.status,
+            raw_response.body,
+        )
+        .unwrap();
+        let encoded = super::bounded_response_json_with_limit_and_encoder(
+            &mut response,
+            &budget,
+            64,
+            crate::protocol::response_json,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_str(&encoded.json).unwrap();
         assert_eq!(value["status"], 500);
         assert_eq!(value["body"], "");
-        assert!(json.len() <= 64);
+        assert!(encoded.json.len() <= 64);
+    }
+
+    #[test]
+    fn ws_precheck_never_serializes_the_oversized_original() {
+        let budget = MemoryBudget::new(128);
+        let mut response =
+            BudgetedResponse::try_new(&budget, "uid".into(), 200, "\u{0001}".repeat(8)).unwrap();
+        let encoded_inputs = RefCell::new(Vec::new());
+
+        let encoded = super::bounded_response_json_with_limit_and_encoder(
+            &mut response,
+            &budget,
+            64,
+            |candidate| {
+                encoded_inputs
+                    .borrow_mut()
+                    .push((candidate.status, candidate.body.len()));
+                crate::protocol::response_json(candidate)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(*encoded_inputs.borrow(), vec![(500, 0)]);
+        let value: Value = serde_json::from_str(&encoded.json).unwrap();
+        assert_eq!(value["status"], 500);
+        assert_eq!(value["body"], "");
+        assert_eq!(
+            budget.high_watermark(),
+            response.retained_bytes() + encoded.reservation.bytes()
+        );
+        drop(encoded);
+        drop(response);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn form_precheck_runs_before_the_eager_encoder() {
+        let budget = MemoryBudget::new(50);
+        let mut context = context("http://example.test", 3, false);
+        context.memory_budget = budget.clone();
+        let response =
+            BudgetedResponse::try_new(&budget, "uid".into(), 200, "\u{0000}".repeat(8)).unwrap();
+        let encoder_calls = Cell::new(0);
+
+        let result =
+            super::prepare_form_request_with_encoder(&context, &response, |_response, _length| {
+                encoder_calls.set(encoder_calls.get() + 1);
+                Ok(String::new())
+            });
+
+        assert!(result.is_err());
+        assert_eq!(encoder_calls.get(), 0);
+        assert_eq!(budget.used(), response.retained_bytes());
+        assert_eq!(budget.high_watermark(), response.retained_bytes());
+    }
+
+    #[test]
+    fn worker_context_clones_share_one_process_budget() {
+        let mut first = context("http://example.test", 3, false);
+        first.memory_budget = MemoryBudget::new(10);
+        let second = first.clone();
+
+        let reservation = first.memory_budget.try_reserve(6).unwrap();
+        assert!(second.memory_budget.try_reserve(5).is_err());
+        assert_eq!(second.memory_budget.used(), 6);
+        drop(reservation);
+        assert_eq!(first.memory_budget.used(), 0);
     }
 
     async fn take_register(events: &mut mpsc::Receiver<Event>) -> Value {
