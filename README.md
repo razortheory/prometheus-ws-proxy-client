@@ -1,10 +1,10 @@
 # Prometheus WebSocket Proxy Client
 
-[![CI](https://github.com/roman-karpovich/prometheus-ws-proxy-client/actions/workflows/ci.yml/badge.svg)](https://github.com/roman-karpovich/prometheus-ws-proxy-client/actions/workflows/ci.yml)
+[![CI](https://github.com/razortheory/prometheus-ws-proxy-client/actions/workflows/ci.yml/badge.svg)](https://github.com/razortheory/prometheus-ws-proxy-client/actions/workflows/ci.yml)
 
 `proxy-client` lets Prometheus scrape exporters in private networks without opening inbound exporter ports. The client keeps outbound WebSocket connections to the proxy server, receives allow-listed scrape requests, calls local exporters, and returns their status and body.
 
-This is product version 3. It preserves the configuration, CLI, routes, and historical wire protocols used by the long-running Python proxy. The matching server is [prometheus-ws-proxy-server](https://github.com/roman-karpovich/prometheus-ws-proxy-server).
+This is product version 3. It preserves the configuration, CLI, routes, and historical wire protocols used by the long-running Python proxy. The matching server is [prometheus-ws-proxy-server](https://github.com/razortheory/prometheus-ws-proxy-server).
 
 ## How it works
 
@@ -39,7 +39,7 @@ Releases contain one stripped, static Linux amd64 binary and its checksum. Pin a
 
 ```bash
 VERSION=v3.0.1
-BASE="https://github.com/roman-karpovich/prometheus-ws-proxy-client/releases/download/${VERSION}"
+BASE="https://github.com/razortheory/prometheus-ws-proxy-client/releases/download/${VERSION}"
 curl -fLO "${BASE}/proxy-client-linux-amd64"
 curl -fLO "${BASE}/proxy-client-linux-amd64.sha256"
 sha256sum --check proxy-client-linux-amd64.sha256
