@@ -2,44 +2,107 @@
 
 [![CI](https://github.com/razortheory/prometheus-ws-proxy-client/actions/workflows/ci.yml/badge.svg)](https://github.com/razortheory/prometheus-ws-proxy-client/actions/workflows/ci.yml)
 
-`proxy-client` lets Prometheus scrape exporters in private networks without opening inbound exporter ports. The client keeps outbound WebSocket connections to the proxy server, receives allow-listed scrape requests, calls local exporters, and returns their status and body.
+`proxy-client` is the outbound agent for scraping Prometheus exporters in private
+networks. It keeps one or more WebSocket connections to the proxy service,
+accepts only configured resource names, performs the corresponding local HTTP
+GET, and returns the exporter status and body.
 
-This is product version 3. It preserves the configuration, CLI, routes, and historical wire protocols used by the long-running Python proxy. The matching server is [prometheus-ws-proxy-server](https://github.com/razortheory/prometheus-ws-proxy-server).
+The matching public-side component is
+[prometheus-ws-proxy-server](https://github.com/razortheory/prometheus-ws-proxy-server).
 
-## How it works
+## Why this exists
 
-```text
-Prometheus
-    |  GET /proxy/request/<instance>/<resource>/
-    v
-proxy server  <==== WebSocket ====  proxy-client  ---- HTTP ----> exporter
-    ^                                      |
-    +--------- WebSocket or HTTP ----------+
+Prometheus normally needs an inbound path to every exporter. This pair reverses
+that connection: the client dials out from the exporter network, so exporter
+ports do not need to be exposed publicly. The public request contains an
+instance and a logical resource name, never an arbitrary exporter URL.
+
+## Architecture and trust boundaries
+
+```mermaid
+flowchart LR
+    P["Prometheus"]
+
+    subgraph Edge["Authenticated TLS edge"]
+        RP["Reverse proxy / Cloudflare Access"]
+    end
+
+    subgraph ServerNet["Controlled server network"]
+        S["prometheus-proxy-server<br/>in-memory connection registry"]
+    end
+
+    subgraph PrivateNet["Private exporter network"]
+        C["proxy-client<br/>outbound workers"]
+        X["Configured exporters"]
+        C -->|"HTTP GET to allow-listed URL"| X
+        X -->|"status + UTF-8 body"| C
+    end
+
+    P -->|"scrape GET"| RP
+    C <-->|"outbound WS/WSS connection"| RP
+    C -->|"v3 HTTP/HTTPS response POST"| RP
+    RP <-->|"HTTP + upgraded WebSocket"| S
+    RP -->|"status + body"| P
 ```
 
-Each worker connection handles one scrape at a time. `--parallel=3` opens three independent worker connections, so a slow exporter cannot create an unbounded queue inside one worker.
+The edge is a required trust boundary, not part of either Rust binary. The
+server has no built-in TLS or authentication. The client trusts the configured
+proxy endpoint and the local `resources` map; Prometheus-facing input cannot
+change an exporter URL.
 
-## Compatibility
+## Wire-v3 scrape flow
 
-Product version and wire version are separate concepts. Product v3 supports all historical wire modes:
+The sequence below treats the edge and backend as one logical proxy endpoint;
+the architecture diagram above shows the physical hop between them.
 
-| `--protocol` | Selection handshake | Response transport | Intended compatibility |
-| --- | --- | --- | --- |
-| `1` | Direct request | WebSocket | Oldest clients and servers |
-| `2` | `ready` / selected worker | WebSocket | Existing Rust v2 deployments |
-| `3` | `ready` / selected worker | HTTP form POST | Existing Python deployments and the v3 default |
+```mermaid
+sequenceDiagram
+    participant P as Prometheus
+    participant S as Proxy server
+    participant C as Selected client worker
+    participant X as Exporter
 
-The Rust v3 server accepts old Python clients and Rust wire v1/v2 clients. This client can connect to the old Python server when configured with its supported wire version. That allows a server-first rollout without changing scrape target syntax.
+    C->>S: outbound WS/WSS + register(instance, worker, version=3)
+    P->>S: GET /proxy/request/{instance}/{resource}/
+    S->>C: ready(uid)
+    C->>S: ready(uid, worker)
+    S->>C: request(uid, resource)
+    C->>X: GET resources[resource]
+    X-->>C: HTTP status + UTF-8 body
+    alt response POST succeeds
+        C->>S: POST /proxy/response/{uid}/ (status, body)
+    else response POST fails
+        C-->>S: response(uid, status, body) on WebSocket
+    end
+    S-->>P: exporter status + body
+```
 
-Wire v3 uses an HTTP response POST and falls back to a WebSocket response when that POST fails or times out. Delivery is therefore transport-level at-least-once: if the POST was applied but its reply was lost, the same UID can be sent again. The Rust server consumes pending UIDs once, and the legacy Python server safely overwrites the same UID result.
+One worker handles one scrape at a time. `--parallel 3` creates three independent
+connections and permits up to three concurrent exporter calls from this process.
+Response headers are not transported.
+
+## Wire compatibility
+
+Product version and wire version are separate. This v3 client retains all three
+historical wire modes so client and server migrations can be staged.
+
+| `--protocol` | Worker selection | Response transport |
+| --- | --- | --- |
+| `1` | Server dispatches directly | WebSocket |
+| `2` | `ready` handshake selects an idle worker | WebSocket |
+| `3` (default) | `ready` handshake selects an idle worker | HTTP form POST, with WebSocket fallback |
+
+Use the wire version supported by the server being contacted. The companion v3
+Rust server accepts all three modes.
 
 ## Install a release
 
-Releases contain one stripped, static Linux amd64 binary and its checksum. Pin a version in automation:
+Releases contain a stripped, static Linux amd64 binary and a checksum:
 
 ```bash
 VERSION=v3.0.1
 BASE="https://github.com/razortheory/prometheus-ws-proxy-client/releases/download/${VERSION}"
+
 curl -fLO "${BASE}/proxy-client-linux-amd64"
 curl -fLO "${BASE}/proxy-client-linux-amd64.sha256"
 sha256sum --check proxy-client-linux-amd64.sha256
@@ -47,21 +110,21 @@ sudo install -m 0755 proxy-client-linux-amd64 /usr/local/bin/proxy-client
 proxy-client --version
 ```
 
-Verify the canonical filename before installing it under the shorter `proxy-client` name; the checksum file intentionally contains the release asset basename.
-
-The binary is built with musl and rustls and has no runtime dependency on glibc or OpenSSL. The host still needs a current `ca-certificates` package for TLS certificate validation.
+The release binary uses musl and rustls; it does not depend on glibc or OpenSSL
+at runtime. The host still needs a current CA certificate store when `https` or
+`wss` endpoints are used.
 
 ## Configuration
 
-The positional argument is a JSON file:
+Pass a JSON file as the positional argument. This local example pairs with the
+server repository's `example.config.json` on port `8081`:
 
 ```json
 {
   "instance": "host-a",
-  "target": "https://prometheus.example.com/proxy/",
+  "target": "ws://127.0.0.1:8081/proxy/",
   "resources": {
-    "node": "http://127.0.0.1:9100/metrics",
-    "application": "http://127.0.0.1:9200/metrics"
+    "node": "http://127.0.0.1:9100/metrics"
   },
   "cf_access_enabled": false,
   "cf_access_key": "",
@@ -69,110 +132,164 @@ The positional argument is a JSON file:
 }
 ```
 
-- `instance` is the name used in the Prometheus request route.
-- `target` accepts either an HTTP(S) base such as `https://host/proxy/` or an exact WebSocket endpoint such as `wss://host/proxy/ws/`. HTTP maps to WS and HTTPS maps to WSS automatically.
-- `resources` is an allow-list from public resource name to exporter URL. An unknown name returns exactly `404` with `No such resource` and is never treated as a URL.
-- `cf_access_enabled`, `cf_access_key`, and `cf_access_secret` enable Cloudflare Access service-token headers on the WebSocket and wire-v3 response POST. Secret values are redacted from debug output.
-- `ec2_meta_domain` is optional and defaults to `http://169.254.169.254`.
+The committed [`example.config.json`](./example.config.json) uses `wss` and
+placeholder Cloudflare Access credentials, so it assumes a TLS-terminating edge.
 
-Set `instance` to `ec2` to resolve the EC2 instance ID once at startup. The client tries IMDSv2 first and falls back to IMDSv1 for compatibility.
+| Field | Required | Default | Meaning |
+| --- | --- | --- | --- |
+| `instance` | yes | — | Public instance identifier. The special value `ec2` is resolved to the EC2 instance ID at startup. |
+| `target` | yes | — | Proxy base URL or exact WebSocket endpoint. Accepted schemes: `http`, `https`, `ws`, `wss`. |
+| `resources` | yes | — | Map of public resource names to exporter URLs. The client performs HTTP GET requests only. |
+| `cf_access_enabled` | no | `false` | Add Cloudflare Access service-token headers when connecting and posting v3 responses. |
+| `cf_access_key` | no | empty string | Value of `CF-Access-Client-Id`. |
+| `cf_access_secret` | no | empty string | Value of `CF-Access-Client-Secret`. |
+| `ec2_meta_domain` | no | `http://169.254.169.254` | EC2 metadata base URL used only when `instance` is `ec2`. |
 
-The JSON can contain Cloudflare credentials. Keep it owned by the service account and mode `0600`; do not commit production values or pass them through logs.
+An HTTP(S) base is normalized to `<base>/ws/` for WebSocket traffic and
+`<base>/response/{uid}/` for wire-v3 responses. Supplying an exact `/ws` endpoint
+also works. Query strings and fragments are discarded during normalization.
 
-## Command line
+For `instance: "ec2"`, startup tries IMDSv2 first and falls back to IMDSv1. The
+resolved instance ID is retained for the lifetime of the process. Instance IDs
+are limited to 256 bytes and resource names to 512 bytes.
+
+## Run
 
 ```text
-proxy-client [CONFIG] [--parallel <N>] [--protocol <1|2|3>] [-v...] [--sentry_dsn <DSN>]
+proxy-client [OPTIONS] [CONFIG]
 ```
-
-Example:
 
 ```bash
 proxy-client /etc/prometheus-proxy/client.json \
-  --parallel=3 \
-  --protocol=3 \
+  --parallel 3 \
+  --protocol 3 \
   -v
 ```
 
-Defaults are `client_config.json`, three workers, and wire protocol 3. `RUST_LOG` overrides the verbosity-derived log filter. Application debug and trace logs remain available, but debug and trace from HTTP/WebSocket transport dependencies are hard-disabled so request headers cannot be exposed by `-vvv` or `RUST_LOG=trace`. The underscore spelling of `--sentry_dsn` is retained for existing service definitions.
+| Option | Default | Notes |
+| --- | --- | --- |
+| `CONFIG` | `client_config.json` | JSON configuration path. |
+| `-p`, `--parallel <N>` | `3` | Positive number of independent workers/connections. |
+| `-r`, `--protocol <1|2|3>` | `3` | Historical wire protocol. |
+| `-v`, `--verbose` | none | Repeat for `info`, `debug`, then `trace`; without it the default is `warn`. |
+| `--sentry_dsn <DSN>` | unset | Enable Sentry error reporting. The underscore spelling is intentional for compatibility. |
 
-## systemd
+`RUST_LOG` overrides the verbosity-derived filter. Debug and trace events from
+HTTP/WebSocket transport crates remain suppressed so increasing verbosity does
+not expose raw authentication headers.
 
-```ini
-[Unit]
-Description=Prometheus WebSocket proxy client
-After=network-online.target
-Wants=network-online.target
+SIGINT and SIGTERM start graceful shutdown. The process gives all workers a
+shared 15-second deadline before exiting.
 
-[Service]
-User=prometheus
-Group=prometheus
-ExecStart=/usr/local/bin/proxy-client /etc/prometheus-proxy/client.json --parallel=3 --protocol=3
-Restart=always
-RestartSec=2
-TimeoutStopSec=20
-NoNewPrivileges=true
+## Security model
 
-[Install]
-WantedBy=multi-user.target
-```
+- Run production traffic through a trusted TLS/authentication edge. Plain `ws`
+  and `http` are suitable only inside a network where that transport is trusted;
+  otherwise service-token headers and metrics travel in cleartext.
+- Treat `resources` as privileged configuration. It is the SSRF boundary: remote
+  requests select only map keys, while operators control the corresponding
+  initial URLs. The HTTP client follows redirects, so redirect targets must also
+  be trusted.
+- Protect configuration files containing Cloudflare credentials with restrictive
+  ownership and permissions; do not commit production values.
+- Cloudflare credentials are attached to the WebSocket handshake and wire-v3
+  response POST only when `cf_access_enabled` is true. Debug formatting redacts
+  both values and logs resource names rather than their configured URLs.
+- Keep exporters bound to private or loopback interfaces. This proxy removes the
+  need for a public exporter listener; it does not authenticate the exporter.
+- Enabling Sentry sends error telemetry to the configured external DSN; treat it
+  as another explicit trust boundary.
 
-The client reconnects internally after connection loss and attempts graceful shutdown within 15 seconds.
+## Operational behavior and limits
 
-## Resource and failure bounds
+| Behavior | Bound |
+| --- | --- |
+| Exporter connect / total request timeout | 5 seconds / 60 seconds |
+| Proxy WebSocket connect timeout | 10 seconds |
+| Reconnect delay | 1 second after a disconnected attempt |
+| Heartbeat | every 20 seconds; stale after 45 seconds without a pong |
+| WebSocket send timeout | 5 seconds |
+| Exporter body and WebSocket message | 64 MiB each |
+| Shared response-memory budget | 256 MiB per process |
+| Active exporter calls | one per worker |
+| Busy-response queue | 8 entries; up to 4 concurrent v3 POST attempts |
 
-- One active exporter scrape per worker connection.
-- 64 MiB maximum exporter body and WebSocket message.
-- Exporter connect timeout: 5 seconds; total request timeout: 60 seconds.
-- Proxy WebSocket connect timeout: 10 seconds; reconnect delay: 1 second.
-- Heartbeat every 20 seconds; stale connection timeout: 45 seconds.
-- WebSocket writes and fallback response queues are bounded.
+The process does not build an unbounded scrape task pool. Increase `--parallel`
+only when the expected scrape concurrency justifies the extra sockets and memory.
 
-Choose `--parallel` from expected scrape concurrency. Adding workers increases concurrency and open sockets; it does not create an unbounded task pool.
+Important response behavior:
 
-## Build and test from source
+- unknown resource: `404` with `No such resource`;
+- exporter connection, timeout, decoding, or size failure: `500` with an empty body;
+- a second request delivered to an already-busy worker: `503` with an empty body;
+- successful exporter calls: exporter status and UTF-8 body are preserved.
 
-Rust 1.96 is pinned for normal development. The declared minimum supported Rust version is 1.88.
-Cargo uses `sccache` through `.cargo/config.toml`, so install sccache 0.16.0 and
-keep it on `PATH` before running the commands below. Local Cargo builds share
-the user's normal sccache store; GitHub Actions uses its cache backend.
+Wire-v3 delivery is transport-level at-least-once: if an HTTP response POST was
+accepted but its reply was lost, the client can fall back to WebSocket with the
+same UID. The companion server consumes pending UIDs once.
+
+Configuration is loaded once at startup. Resource URL syntax is checked only
+when that resource is requested; restart the process after changing the file.
+
+## Development
+
+The repository pins Rust `1.96.0`; `Cargo.toml` declares Rust `1.88` as the
+minimum supported version. Cargo is configured to use `sccache`, so install
+`sccache` `0.16.0` and keep it on `PATH`.
 
 ```bash
 cargo +1.96.0 fmt --all -- --check
+cargo +1.96.0 check --locked --all-targets --all-features
 cargo +1.96.0 test --locked --all-targets --all-features
 cargo +1.96.0 clippy --locked --all-targets --all-features -- -D warnings
+cargo +1.88.0 check --locked --all-targets --all-features
 cargo +1.88.0 test --locked --all-targets --all-features
 ```
 
-Build the release artifact exactly as CI does:
+Run directly from the checkout:
+
+```bash
+cargo +1.96.0 run --locked -- ./example.config.json --parallel 3 --protocol 3 -v
+```
+
+The example targets `wss://localhost:8081`; use a TLS edge for that value or
+change it to `ws://127.0.0.1:8081/proxy/` for a direct local server.
+
+## Build the Linux artifact with Docker
+
+The Dockerfile produces an artifact stage, not a runtime image:
 
 ```bash
 docker buildx build \
   --platform linux/amd64 \
   --target artifact \
-  --secret id=actions_results_url,env=ACTIONS_RESULTS_URL \
-  --secret id=actions_runtime_token,env=ACTIONS_RUNTIME_TOKEN \
   --output type=local,dest=dist \
   .
+
+./dist/proxy-client-linux-amd64 --version
 ```
 
-The BuildKit secrets are optional when those environment variables are unset.
-Docker builds then fall back to the builder's shared local sccache mount.
+The builder downloads the pinned `sccache` release with checksum verification.
+CI additionally passes optional GitHub Actions cache credentials as BuildKit
+secrets.
 
-## Releases and Ubuntu support
+## CI and releases
 
-Pushing a tag such as `v3.0.1` starts the release workflow. The tag must exactly match the Cargo package version. CI builds one static `proxy-client-linux-amd64`, verifies that it has no ELF interpreter or dynamic dependencies, creates a SHA-256 file, and runs that same artifact in Ubuntu 16.04, 18.04, 20.04, 22.04, 24.04, and 26.04 containers before publishing it.
+GitHub Actions checks formatting, tests, Clippy with warnings denied, Rust 1.88
+MSRV, and the static Linux amd64 artifact. CI smoke-tests the artifact in an
+Ubuntu 16.04 container. A `v*` tag must exactly match the Cargo package version;
+the release workflow then runs the same artifact in Ubuntu 16.04, 18.04, 20.04,
+22.04, 24.04, and 26.04 userspaces before publishing it and its SHA-256 file.
 
-Container smoke tests verify each Ubuntu userspace, not its historical kernel. In particular, Ubuntu 16.04 normally runs kernel 4.4 while GitHub and Docker hosts use a newer kernel. Treat Ubuntu 16 support as provisional until the artifact has also run on a real Ubuntu 16 host or VM.
+Those container checks validate userspace compatibility on the runner's kernel.
+They are not proof that the binary runs on each distribution's historical
+kernel, so Ubuntu 16 support remains provisional until verified on a real host
+or VM.
 
-## Safe rollout and rollback
+## Related repository
 
-1. Run the Rust v3 server on a shadow port or hostname and test it with existing Python clients.
-2. Point the existing Nginx `/proxy` upstream at Rust while leaving client configuration and Prometheus targets unchanged.
-3. Keep the Python server running on its previous rollback port, but remove it from the production upstream.
-4. Replace Python clients with this binary in small batches.
-5. Remove the Python server only after the observation window.
+- [prometheus-ws-proxy-server](https://github.com/razortheory/prometheus-ws-proxy-server) — accepts Prometheus requests and dispatches them to connected workers.
 
-To roll back the server, restore the Nginx upstream to Python. Rust clients continue to work with the old Python server, so client batches do not have to be rolled back at the same time.
+## License
 
-The current Rust server is intentionally single-process and keeps connection state in memory. Do not place multiple active server processes behind one route: there is no shared connection registry.
+No license file is currently included in this repository.
