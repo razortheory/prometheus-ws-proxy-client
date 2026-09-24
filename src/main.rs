@@ -37,6 +37,10 @@ impl<S> Filter<S> for TransportLogCap {
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     let cli = Cli::parse();
+    #[cfg(unix)]
+    let _reload_task = tokio::spawn(ignore_reload_signal(tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::hangup(),
+    )?));
     install_rustls_provider();
     let user_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(default_log_filter(cli.verbose)));
@@ -111,6 +115,19 @@ fn transport_target(target: &str) -> bool {
 
 fn transport_level_allowed(target: &str, level: &Level) -> bool {
     !transport_target(target) || matches!(*level, Level::WARN | Level::ERROR)
+}
+
+/// The systemd unit maps `reload` to SIGHUP, whose default action terminates
+/// the process and drops every connection without a close frame. The client
+/// reads its configuration only at startup, so the signal is logged and
+/// ignored; a configuration change needs a restart.
+#[cfg(unix)]
+async fn ignore_reload_signal(mut hangup: tokio::signal::unix::Signal) {
+    while hangup.recv().await.is_some() {
+        tracing::warn!(
+            "SIGHUP received; configuration is read only at startup, restart to apply changes"
+        );
+    }
 }
 
 async fn shutdown_signal() -> Result<(), BoxError> {
