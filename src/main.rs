@@ -37,6 +37,7 @@ impl<S> Filter<S> for TransportLogCap {
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     let cli = Cli::parse();
+    let shutdown_signals = ShutdownSignals::install()?;
     #[cfg(unix)]
     let _reload_task = tokio::spawn(ignore_reload_signal(tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::hangup(),
@@ -59,6 +60,7 @@ async fn main() -> Result<(), BoxError> {
         ))
     });
 
+    tracing::info!("signal handlers installed");
     tracing::info!(config = %cli.config.display(), "loading configuration");
     let config = Arc::new(Config::load(&cli.config, &metadata_client()?).await?);
     let target = Target::parse(&config.target)?;
@@ -83,7 +85,7 @@ async fn main() -> Result<(), BoxError> {
         )));
     }
 
-    shutdown_signal().await?;
+    shutdown_signals.recv().await?;
     shutdown.cancel();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     for worker in workers {
@@ -131,25 +133,50 @@ async fn ignore_reload_signal(mut hangup: tokio::signal::unix::Signal) {
     }
 }
 
-async fn shutdown_signal() -> Result<(), BoxError> {
-    let ctrl_c = tokio::signal::ctrl_c();
-
+/// SIGINT and SIGTERM streams created at startup. Creating a stream replaces
+/// the default action immediately; `tokio::signal::ctrl_c()` or a stream
+/// created later would leave a window in which the signal kills the process
+/// without a graceful shutdown.
+struct ShutdownSignals {
     #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?
-            .recv()
-            .await;
-        Ok::<(), std::io::Error>(())
-    };
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
 
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<Result<(), std::io::Error>>();
-
-    tokio::select! {
-        result = ctrl_c => result?,
-        result = terminate => result?,
+impl ShutdownSignals {
+    fn install() -> Result<Self, BoxError> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            Ok(Self {
+                interrupt: signal(SignalKind::interrupt())?,
+                terminate: signal(SignalKind::terminate())?,
+            })
+        }
+        #[cfg(not(unix))]
+        Ok(Self {})
     }
-    Ok(())
+
+    async fn recv(self) -> Result<(), BoxError> {
+        #[cfg(unix)]
+        {
+            let Self {
+                mut interrupt,
+                mut terminate,
+            } = self;
+            tokio::select! {
+                _ = interrupt.recv() => {}
+                _ = terminate.recv() => {}
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await?;
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
