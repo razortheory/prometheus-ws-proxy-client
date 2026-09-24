@@ -4,7 +4,7 @@ use proxy_client::config::{metadata_client, Config};
 use proxy_client::memory::{MemoryBudget, DEFAULT_MEMORY_BUDGET_SIZE};
 use proxy_client::resource::shared_http_client;
 use proxy_client::target::Target;
-use proxy_client::worker::{run_worker, WorkerContext};
+use proxy_client::worker::{run_worker, Timing, WorkerContext};
 use proxy_client::{install_rustls_provider, BoxError};
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,6 +69,7 @@ async fn main() -> Result<(), BoxError> {
         client,
         protocol: cli.protocol,
         memory_budget: MemoryBudget::new(DEFAULT_MEMORY_BUDGET_SIZE),
+        timing: Timing::default(),
     };
 
     let shutdown = CancellationToken::new();
