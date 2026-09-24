@@ -18,22 +18,61 @@ use tokio::time::Instant;
 use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, WebSocketConfig};
 use tokio_util::sync::CancellationToken;
 
 const CF_ACCESS_CLIENT_ID: &str = "CF-Access-Client-Id";
 const CF_ACCESS_CLIENT_SECRET: &str = "CF-Access-Client-Secret";
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+/// A connection that lived at least this long resets the reconnect backoff.
+const STABLE_CONNECTION: Duration = Duration::from_secs(60);
+const CONTROL_QUEUE_CAPACITY: usize = 32;
+const BULK_QUEUE_CAPACITY: usize = 8;
 const BUSY_RESPONSE_QUEUE_CAPACITY: usize = 8;
 const BUSY_RESPONSE_CONCURRENCY: usize = 4;
-const BUSY_POST_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(not(test))]
-const WS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(test)]
-const WS_SEND_TIMEOUT: Duration = Duration::from_millis(100);
+/// Response bodies get extra send time as if the link carried at least this
+/// many bytes per second.
+const MIN_BULK_THROUGHPUT: f64 = 64.0 * 1024.0;
+/// Matches the server heartbeat timeout: the server hears nothing else on
+/// this connection while one large frame is uploading.
+const MAX_BULK_SEND_TIMEOUT: Duration = Duration::from_secs(45);
+const MAX_POST_TIMEOUT: Duration = Duration::from_secs(60);
+/// After a POST timed out the path is slow; resending a larger body over the
+/// WebSocket doubles the upload and arrives after the scrape has ended.
+const FALLBACK_AFTER_TIMEOUT_LIMIT: usize = 256 * 1024;
+
+/// Connection timing. Defaults match the server: it pings every 15 seconds
+/// and drops a connection after 45 silent seconds.
+#[derive(Clone, Copy, Debug)]
+pub struct Timing {
+    pub heartbeat_interval: Duration,
+    /// The connection is considered dead after this long without any frame
+    /// from the server.
+    pub heartbeat_timeout: Duration,
+    /// Send timeout for small messages; bulk responses scale it by size.
+    pub send_timeout: Duration,
+    /// Base time for one wire-v3 response POST, scaled by body size like
+    /// WebSocket responses. A POST stuck on a dead pooled connection no
+    /// longer keeps the worker busy for the 60 second exporter timeout.
+    pub post_timeout: Duration,
+    /// Time allowed to flush a close frame before dropping the connection.
+    pub close_timeout: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval: Duration::from_secs(20),
+            heartbeat_timeout: Duration::from_secs(45),
+            send_timeout: Duration::from_secs(5),
+            post_timeout: Duration::from_secs(10),
+            close_timeout: Duration::from_secs(1),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct WorkerContext {
@@ -42,27 +81,48 @@ pub struct WorkerContext {
     pub client: Arc<reqwest::Client>,
     pub protocol: u8,
     pub memory_budget: MemoryBudget,
-}
-
-struct Completion {
-    response: Option<BudgetedResponse>,
-    delivered_by_http: bool,
+    pub timing: Timing,
 }
 
 pub async fn run_worker(worker_name: String, context: WorkerContext, shutdown: CancellationToken) {
     tracing::info!(worker = %worker_name, "worker started");
+    let mut quick_failures = 0;
     while !shutdown.is_cancelled() {
+        let started = Instant::now();
         if let Err(error) = run_connection(&worker_name, &context, &shutdown).await {
             if !shutdown.is_cancelled() {
                 tracing::warn!(worker = %worker_name, error = %error, "connection ended");
             }
         }
+        if started.elapsed() >= STABLE_CONNECTION {
+            quick_failures = 0;
+        } else {
+            quick_failures += 1;
+        }
+        let delay = reconnect_delay(quick_failures, random_fraction());
         tokio::select! {
             () = shutdown.cancelled() => break,
-            () = tokio::time::sleep(RECONNECT_DELAY) => {}
+            () = tokio::time::sleep(delay) => {}
         }
     }
     tracing::info!(worker = %worker_name, "worker stopped");
+}
+
+/// Exponential backoff for connections that keep failing quickly, with
+/// jitter so that a network-wide disconnect does not reconnect every worker
+/// in the same instant. `fraction` is uniformly distributed in `[0, 1)`.
+fn reconnect_delay(quick_failures: u32, fraction: f64) -> Duration {
+    let exponent = quick_failures.saturating_sub(1).min(5);
+    let base = RECONNECT_DELAY
+        .saturating_mul(1 << exponent)
+        .min(MAX_RECONNECT_DELAY);
+    base.mul_f64(0.5 + fraction.clamp(0.0, 1.0) / 2.0)
+}
+
+/// Uniform in `[0, 1)` from the 48 leading random bits of a v4 UUID; the
+/// version and variant bits come later.
+fn random_fraction() -> f64 {
+    (uuid::Uuid::new_v4().as_u128() >> 80) as f64 / (1u64 << 48) as f64
 }
 
 pub async fn run_connection(
@@ -81,212 +141,399 @@ pub async fn run_connection(
     websocket_config.max_write_buffer_size = MAX_WS_MESSAGE_SIZE + 1024 * 1024;
     let (websocket, _) = tokio::time::timeout(
         CONNECT_TIMEOUT,
-        connect_async_with_config(request, Some(websocket_config), false),
+        connect_async_with_config(request, Some(websocket_config), true),
     )
-    .await??;
-    let (mut write, mut read) = websocket.split();
+    .await
+    .map_err(|_| "websocket connect timed out")??;
+    let (write, read) = websocket.split();
 
-    send_ws(
-        &mut write,
-        Message::Text(
+    let (control_tx, control_rx) = mpsc::channel::<Message>(CONTROL_QUEUE_CAPACITY);
+    let (bulk_tx, bulk_rx) = mpsc::channel::<EncodedResponse>(BULK_QUEUE_CAPACITY);
+    control_tx
+        .try_send(Message::Text(
             register_json(context.protocol, &context.config.instance, worker_name)?.into(),
-        ),
-    )
-    .await?;
+        ))
+        .map_err(|_| "register message could not be queued")?;
+    let writer = tokio::spawn(run_writer(
+        write,
+        control_rx,
+        bulk_rx,
+        context.timing.send_timeout,
+    ));
     tracing::info!(worker = %worker_name, "connected and registered");
 
-    let (completion_tx, mut completion_rx) = mpsc::channel::<Completion>(1);
     let (busy_response_tx, busy_response_rx) =
-        mpsc::channel::<BudgetedResponse>(BUSY_RESPONSE_QUEUE_CAPACITY);
-    let (busy_fallback_tx, mut busy_fallback_rx) =
         mpsc::channel::<BudgetedResponse>(BUSY_RESPONSE_QUEUE_CAPACITY);
     let busy_response_actor = tokio::spawn(run_busy_response_actor(
         context.clone(),
         busy_response_rx,
-        busy_fallback_tx,
+        bulk_tx.clone(),
     ));
-    let mut active_task: Option<JoinHandle<()>> = None;
-    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    heartbeat.tick().await;
-    let mut last_pong = Instant::now();
-
-    let result = async {
-        loop {
-            tokio::select! {
-            () = shutdown.cancelled() => {
-                let _ = send_ws(&mut write, Message::Close(None)).await;
-                break Ok(());
-            }
-            _ = heartbeat.tick() => {
-                if last_pong.elapsed() > HEARTBEAT_TIMEOUT {
-                    break Err("websocket heartbeat timed out".into());
-                }
-                send_ws(&mut write, Message::Text(PING_JSON.into())).await?;
-                send_ws(&mut write, Message::Ping(worker_name.as_bytes().to_vec().into())).await?;
-            }
-            completion = completion_rx.recv(), if active_task.is_some() => {
-                let Some(completion) = completion else {
-                    break Err("resource task channel closed".into());
-                };
-                if let Some(task) = active_task.take() {
-                    task.await?;
-                }
-                if !completion.delivered_by_http {
-                    if let Some(response) = completion.response {
-                        send_response_ws(&mut write, &context.memory_budget, response).await?;
-                    }
-                }
-            }
-            fallback = busy_fallback_rx.recv() => {
-                let Some(fallback) = fallback else {
-                    break Err("busy response actor closed unexpectedly".into());
-                };
-                send_response_ws(&mut write, &context.memory_budget, fallback).await?;
-            }
-            message = read.next() => {
-                let Some(message) = message else {
-                    break Err("websocket closed without a close frame".into());
-                };
-                match message? {
-                    Message::Text(text) => {
-                        let incoming = match serde_json::from_str::<IncomingMessage>(text.as_str()) {
-                            Ok(incoming) => incoming,
-                            Err(error) => {
-                                tracing::warn!(error = %error, "ignored invalid websocket JSON");
-                                continue;
-                            }
-                        };
-                        if let Err(error) = incoming.validate() {
-                            tracing::warn!(error = %error, "ignored websocket message with oversized identifier");
-                            continue;
-                        }
-                        match incoming {
-                            IncomingMessage::Ping => {
-                                send_ws(&mut write, Message::Text(PONG_JSON.into())).await?;
-                            }
-                            IncomingMessage::Pong => last_pong = Instant::now(),
-                            IncomingMessage::Ready { uid } => {
-                                if context.protocol >= 2 && active_task.is_none() {
-                                    send_ws(
-                                        &mut write,
-                                        Message::Text(ready_json(&uid, worker_name)?.into()),
-                                    )
-                                    .await?;
-                                } else {
-                                    tracing::warn!("ignored ready message while worker is busy");
-                                }
-                            }
-                            IncomingMessage::Request { uid, resource } => {
-                                if active_task.is_some() {
-                                    tracing::warn!("rejected a second request while worker is busy");
-                                    let busy = match BudgetedResponse::try_new(
-                                        &context.memory_budget,
-                                        uid,
-                                        503,
-                                        String::new(),
-                                    ) {
-                                        Ok(busy) => busy,
-                                        Err(error) => {
-                                            tracing::warn!(error = %error, "busy response rejected by memory budget");
-                                            continue;
-                                        }
-                                    };
-                                    if context.protocol == 3 {
-                                        if let Err(error) = busy_response_tx.try_send(busy) {
-                                            let busy = error.into_inner();
-                                            send_response_ws(
-                                                &mut write,
-                                                &context.memory_budget,
-                                                busy,
-                                            )
-                                            .await?;
-                                        }
-                                    } else {
-                                        send_response_ws(
-                                            &mut write,
-                                            &context.memory_budget,
-                                            busy,
-                                        )
-                                        .await?;
-                                    }
-                                    continue;
-                                }
-
-                                let task_context = context.clone();
-                                let task_completion_tx = completion_tx.clone();
-                                active_task = Some(tokio::spawn(async move {
-                                    let response = call_resource(
-                                        &task_context.client,
-                                        &task_context.config,
-                                        uid,
-                                        &resource,
-                                        &task_context.memory_budget,
-                                    )
-                                    .await;
-                                    let delivered_by_http = if task_context.protocol == 3 {
-                                        match response.as_ref() {
-                                            Some(response) => match post_response(&task_context, response).await {
-                                                Ok(()) => true,
-                                                Err(error) => {
-                                                    tracing::warn!(error = %error, "unable to deliver v3 response; falling back to websocket");
-                                                    false
-                                                }
-                                            }
-                                            None => false,
-                                        }
-                                    } else {
-                                        false
-                                    };
-                                    let _ = task_completion_tx
-                                        .send(Completion {
-                                            response,
-                                            delivered_by_http,
-                                        })
-                                        .await;
-                                }));
-                            }
-                            IncomingMessage::Unknown => tracing::warn!("ignored unknown websocket message"),
-                        }
-                    }
-                    Message::Ping(payload) => {
-                        send_ws(&mut write, Message::Pong(payload)).await?;
-                    }
-                    Message::Pong(_) => last_pong = Instant::now(),
-                    Message::Close(frame) => {
-                        let _ = send_ws(&mut write, Message::Close(frame)).await;
-                        break Ok(());
-                    }
-                    Message::Binary(_) | Message::Frame(_) => {
-                        tracing::warn!("ignored unsupported websocket message");
-                    }
-                }
-            }
-            }
-        }
-    }
-    .await;
-
-    if let Some(task) = active_task {
-        task.abort();
-        let _ = task.await;
-    }
+    let mut session = Session {
+        worker_name,
+        context,
+        control: control_tx,
+        bulk: bulk_tx,
+        busy_responses: busy_response_tx,
+        writer,
+        writer_done: false,
+        active_task: None,
+    };
+    let (result, farewell) = session.run(read, shutdown).await;
+    session.finish(farewell).await;
     busy_response_actor.abort();
     let _ = busy_response_actor.await;
     result
 }
 
+/// State of one connection. Reading happens here; every write goes through
+/// the writer task, so a slow upload never delays reading server frames.
+struct Session<'a> {
+    worker_name: &'a str,
+    context: &'a WorkerContext,
+    control: mpsc::Sender<Message>,
+    bulk: mpsc::Sender<EncodedResponse>,
+    busy_responses: mpsc::Sender<BudgetedResponse>,
+    writer: JoinHandle<Result<(), BoxError>>,
+    writer_done: bool,
+    /// The scrape in progress: exporter call and, for wire v3, the response
+    /// POST. Staying busy until the POST ends keeps uploads from piling up
+    /// on a slow link.
+    active_task: Option<JoinHandle<()>>,
+}
+
+type Farewell = Option<Message>;
+
+fn close_message(code: CloseCode, reason: &'static str) -> Message {
+    Message::Close(Some(CloseFrame {
+        code,
+        reason: reason.into(),
+    }))
+}
+
+impl Session<'_> {
+    async fn run<R>(
+        &mut self,
+        mut read: R,
+        shutdown: &CancellationToken,
+    ) -> (Result<(), BoxError>, Farewell)
+    where
+        R: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
+        let timing = self.context.timing;
+        let (completion_tx, mut completion_rx) = mpsc::channel::<Option<BudgetedResponse>>(1);
+        let mut heartbeat = tokio::time::interval(timing.heartbeat_interval);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        heartbeat.tick().await;
+        let mut last_inbound = Instant::now();
+
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => {
+                    return (Ok(()), Some(close_message(CloseCode::Away, "client shutdown")));
+                }
+                written = &mut self.writer => {
+                    self.writer_done = true;
+                    let error = match written {
+                        Ok(Ok(())) => "websocket writer stopped".into(),
+                        Ok(Err(error)) => error,
+                        Err(error) => Box::new(error) as BoxError,
+                    };
+                    return (Err(error), None);
+                }
+                _ = heartbeat.tick() => {
+                    if last_inbound.elapsed() > timing.heartbeat_timeout {
+                        return (
+                            Err("websocket heartbeat timed out".into()),
+                            Some(close_message(CloseCode::Away, "heartbeat timeout")),
+                        );
+                    }
+                    let _ = self.control.try_send(Message::Text(PING_JSON.into()));
+                    let _ = self
+                        .control
+                        .try_send(Message::Ping(self.worker_name.as_bytes().to_vec().into()));
+                }
+                completion = completion_rx.recv(), if self.active_task.is_some() => {
+                    let Some(response) = completion else {
+                        return (Err("resource task channel closed".into()), None);
+                    };
+                    if let Some(task) = self.active_task.take() {
+                        if let Err(error) = task.await {
+                            return (Err(error.into()), None);
+                        }
+                    }
+                    if let Some(response) = response {
+                        if let Err(error) =
+                            queue_ws_response(&self.bulk, &self.context.memory_budget, response).await
+                        {
+                            return (Err(error), None);
+                        }
+                    }
+                }
+                message = read.next() => {
+                    let message = match message {
+                        Some(Ok(message)) => message,
+                        Some(Err(error)) => return (Err(error.into()), None),
+                        None => return (Err("websocket closed without a close frame".into()), None),
+                    };
+                    last_inbound = Instant::now();
+                    match message {
+                        Message::Text(text) => {
+                            if let Err(error) = self.handle_text(text.as_str(), &completion_tx).await {
+                                return (Err(error), None);
+                            }
+                        }
+                        Message::Ping(payload) => {
+                            let _ = self.control.try_send(Message::Pong(payload));
+                        }
+                        Message::Pong(_) => {}
+                        Message::Close(frame) => {
+                            tracing::warn!(
+                                worker = %self.worker_name,
+                                code = frame.as_ref().map(|frame| u16::from(frame.code)),
+                                reason = frame.as_ref().map(|frame| frame.reason.as_str()),
+                                "server closed the connection"
+                            );
+                            return (Ok(()), Some(Message::Close(frame)));
+                        }
+                        Message::Binary(_) | Message::Frame(_) => {
+                            tracing::warn!("ignored unsupported websocket message");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_text(
+        &mut self,
+        text: &str,
+        completion_tx: &mpsc::Sender<Option<BudgetedResponse>>,
+    ) -> Result<(), BoxError> {
+        let incoming = match serde_json::from_str::<IncomingMessage>(text) {
+            Ok(incoming) => incoming,
+            Err(error) => {
+                tracing::warn!(error = %error, "ignored invalid websocket JSON");
+                return Ok(());
+            }
+        };
+        if let Err(error) = incoming.validate() {
+            tracing::warn!(error = %error, "ignored websocket message with oversized identifier");
+            return Ok(());
+        }
+        match incoming {
+            IncomingMessage::Ping => {
+                let _ = self.control.try_send(Message::Text(PONG_JSON.into()));
+            }
+            IncomingMessage::Pong => {}
+            IncomingMessage::Ready { uid } => {
+                if self.context.protocol >= 2 && self.active_task.is_none() {
+                    let ready = ready_json(&uid, self.worker_name)?;
+                    if self.control.try_send(Message::Text(ready.into())).is_err() {
+                        tracing::warn!("ready answer dropped because the send queue is full");
+                    }
+                } else {
+                    tracing::warn!("ignored ready message while worker is busy");
+                }
+            }
+            IncomingMessage::Request { uid, resource } => {
+                if self.active_task.is_some() {
+                    tracing::warn!("rejected a second request while worker is busy");
+                    match BudgetedResponse::try_new(
+                        &self.context.memory_budget,
+                        uid,
+                        503,
+                        String::new(),
+                    ) {
+                        Ok(busy) => self.answer_busy(busy).await?,
+                        Err(error) => {
+                            tracing::warn!(error = %error, "busy response rejected by memory budget");
+                        }
+                    }
+                    return Ok(());
+                }
+
+                let task_context = self.context.clone();
+                let task_completion_tx = completion_tx.clone();
+                self.active_task = Some(tokio::spawn(async move {
+                    let response = call_resource(
+                        &task_context.client,
+                        &task_context.config,
+                        uid,
+                        &resource,
+                        &task_context.memory_budget,
+                    )
+                    .await;
+                    let websocket_response = match response {
+                        Some(response) if task_context.protocol == 3 => {
+                            deliver_by_post(&task_context, response).await
+                        }
+                        response => response,
+                    };
+                    let _ = task_completion_tx.send(websocket_response).await;
+                }));
+            }
+            IncomingMessage::Unknown => tracing::warn!("ignored unknown websocket message"),
+        }
+        Ok(())
+    }
+
+    /// Wire v3 posts busy answers in the background; older wires, and posts
+    /// that cannot be queued, answer over the WebSocket.
+    async fn answer_busy(&self, response: BudgetedResponse) -> Result<(), BoxError> {
+        let mut response = response;
+        if self.context.protocol == 3 {
+            match self.busy_responses.try_send(response) {
+                Ok(()) => return Ok(()),
+                Err(error) => response = error.into_inner(),
+            }
+        }
+        queue_ws_response(&self.bulk, &self.context.memory_budget, response).await
+    }
+
+    /// Sends the farewell frame if the writer is still healthy, then stops it.
+    async fn finish(mut self, farewell: Farewell) {
+        if let Some(task) = self.active_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        if self.writer_done {
+            return;
+        }
+        drop(self.bulk);
+        drop(self.busy_responses);
+        let queued = farewell.is_some_and(|message| self.control.try_send(message).is_ok());
+        drop(self.control);
+        let flushed = queued
+            && tokio::time::timeout(self.context.timing.close_timeout, &mut self.writer)
+                .await
+                .is_ok();
+        if !flushed {
+            self.writer.abort();
+            let _ = self.writer.await;
+        }
+    }
+}
+
+/// Queues a WebSocket response. A response that cannot be encoded within the
+/// memory budget is dropped with a warning instead of ending the connection.
+async fn queue_ws_response(
+    bulk: &mpsc::Sender<EncodedResponse>,
+    memory_budget: &MemoryBudget,
+    mut response: BudgetedResponse,
+) -> Result<(), BoxError> {
+    let encoded = match bounded_response_json(&mut response, memory_budget) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            tracing::warn!(uid = response.uid, error = %error, "websocket response dropped");
+            return Ok(());
+        }
+    };
+    drop(response);
+    bulk.send(encoded)
+        .await
+        .map_err(|_| "websocket writer stopped".into())
+}
+
+/// Owns the write half. Control frames (heartbeats, ready answers, close)
+/// go before queued response bodies.
+async fn run_writer<S>(
+    mut sink: S,
+    mut control: mpsc::Receiver<Message>,
+    mut bulk: mpsc::Receiver<EncodedResponse>,
+    send_timeout: Duration,
+) -> Result<(), BoxError>
+where
+    S: Sink<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let mut control_open = true;
+    let mut bulk_open = true;
+    loop {
+        tokio::select! {
+            biased;
+            message = control.recv(), if control_open => match message {
+                Some(message @ Message::Close(_)) => {
+                    // Sending fails when the server closed first; closing the
+                    // sink still flushes the reply tungstenite queued for it.
+                    let _ = send_ws(&mut sink, message, send_timeout).await;
+                    let _ = tokio::time::timeout(send_timeout, sink.close()).await;
+                    return Ok(());
+                }
+                Some(message) => send_ws(&mut sink, message, send_timeout).await?,
+                None => control_open = false,
+            },
+            encoded = bulk.recv(), if bulk_open => match encoded {
+                Some(EncodedResponse { json, reservation }) => {
+                    let timeout = bulk_send_timeout(send_timeout, json.len());
+                    let result = send_ws(&mut sink, Message::Text(json.into()), timeout).await;
+                    drop(reservation);
+                    result?;
+                }
+                None => bulk_open = false,
+            },
+            else => return Ok(()),
+        }
+    }
+}
+
+/// A response body needs time proportional to its size on a slow link; a
+/// fixed timeout would drop healthy high-latency connections.
+fn bulk_send_timeout(send_timeout: Duration, length: usize) -> Duration {
+    scaled_timeout(send_timeout, length, MAX_BULK_SEND_TIMEOUT)
+}
+
+fn post_timeout(base: Duration, length: usize) -> Duration {
+    scaled_timeout(base, length, MAX_POST_TIMEOUT)
+}
+
+fn scaled_timeout(base: Duration, length: usize, cap: Duration) -> Duration {
+    let transfer = Duration::from_secs_f64(length as f64 / MIN_BULK_THROUGHPUT);
+    base.saturating_add(transfer).min(cap).max(base)
+}
+
+/// Posts a wire-v3 response and returns it when it should be sent over the
+/// WebSocket instead.
+async fn deliver_by_post(
+    context: &WorkerContext,
+    response: BudgetedResponse,
+) -> Option<BudgetedResponse> {
+    let error = match post_response(context, &response).await {
+        Ok(()) => return None,
+        Err(error) => error,
+    };
+    let timed_out = error
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(reqwest::Error::is_timeout);
+    if timed_out && response.body.len() > FALLBACK_AFTER_TIMEOUT_LIMIT {
+        tracing::warn!(
+            uid = response.uid,
+            body_bytes = response.body.len(),
+            error = %error,
+            "v3 response POST timed out; not resending the large body over websocket"
+        );
+        return None;
+    }
+    tracing::warn!(
+        uid = response.uid,
+        error = %error,
+        "unable to deliver v3 response; falling back to websocket"
+    );
+    Some(response)
+}
+
 async fn run_busy_response_actor(
     context: WorkerContext,
     mut responses: mpsc::Receiver<BudgetedResponse>,
-    fallbacks: mpsc::Sender<BudgetedResponse>,
-) -> Result<(), BoxError> {
+    bulk: mpsc::Sender<EncodedResponse>,
+) {
     let mut posts = FuturesUnordered::new();
     let mut input_open = true;
 
     loop {
         if !input_open && posts.is_empty() {
-            return Ok(());
+            return;
         }
 
         tokio::select! {
@@ -295,15 +542,7 @@ async fn run_busy_response_actor(
                     Some(response) => {
                         let post_context = context.clone();
                         posts.push(async move {
-                            let result = match tokio::time::timeout(
-                                BUSY_POST_TIMEOUT,
-                                post_response(&post_context, &response),
-                            )
-                            .await
-                            {
-                                Ok(result) => result,
-                                Err(error) => Err(Box::new(error) as BoxError),
-                            };
+                            let result = post_response(&post_context, &response).await;
                             (response, result)
                         });
                     }
@@ -320,37 +559,27 @@ async fn run_busy_response_actor(
                         error = %error,
                         "unable to deliver busy v3 response; falling back to websocket"
                     );
-                    fallbacks.send(response).await?;
+                    if queue_ws_response(&bulk, &context.memory_budget, response)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
         }
     }
 }
 
-async fn send_ws<S>(sink: &mut S, message: Message) -> Result<(), BoxError>
+async fn send_ws<S>(sink: &mut S, message: Message, timeout: Duration) -> Result<(), BoxError>
 where
     S: Sink<Message> + Unpin,
     S::Error: std::error::Error + Send + Sync + 'static,
 {
-    tokio::time::timeout(WS_SEND_TIMEOUT, sink.send(message))
-        .await?
+    tokio::time::timeout(timeout, sink.send(message))
+        .await
+        .map_err(|_| "websocket send timed out")?
         .map_err(|error| Box::new(error) as BoxError)
-}
-
-async fn send_response_ws<S>(
-    sink: &mut S,
-    memory_budget: &MemoryBudget,
-    mut response: BudgetedResponse,
-) -> Result<(), BoxError>
-where
-    S: Sink<Message> + Unpin,
-    S::Error: std::error::Error + Send + Sync + 'static,
-{
-    let encoded = bounded_response_json(&mut response, memory_budget)?;
-    let EncodedResponse { json, reservation } = encoded;
-    let result = send_ws(sink, Message::Text(json.into())).await;
-    drop(reservation);
-    result
 }
 
 struct EncodedResponse {
@@ -477,6 +706,7 @@ where
         .client
         .post(url)
         .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .timeout(post_timeout(context.timing.post_timeout, encoded_length))
         .body(form);
     if context.config.cf_access_enabled {
         request = request
@@ -506,7 +736,9 @@ fn encode_form(response: &ResourceResponse, encoded_length: usize) -> Result<Str
 
 #[cfg(test)]
 mod tests {
-    use super::{run_connection, WorkerContext, CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET};
+    use super::{
+        run_connection, Timing, WorkerContext, CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET,
+    };
     use crate::config::Config;
     use crate::memory::{BudgetedResponse, MemoryBudget};
     use crate::target::Target;
@@ -719,6 +951,10 @@ mod tests {
             client: Arc::new(reqwest::Client::new()),
             protocol,
             memory_budget: MemoryBudget::new(crate::memory::DEFAULT_MEMORY_BUDGET_SIZE),
+            timing: Timing {
+                send_timeout: std::time::Duration::from_millis(100),
+                ..Timing::default()
+            },
         }
     }
 
@@ -1046,9 +1282,10 @@ mod tests {
         let result = super::send_ws(
             &mut PendingSink,
             tokio_tungstenite::tungstenite::Message::Text("x".into()),
+            std::time::Duration::from_millis(100),
         )
         .await;
-        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().to_string(), "websocket send timed out");
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
@@ -1145,6 +1382,479 @@ mod tests {
         assert_eq!(second.memory_budget.used(), 6);
         drop(reservation);
         assert_eq!(first.memory_budget.used(), 0);
+    }
+
+    /// One accepted WebSocket connection, driven from the test body.
+    struct ScriptedSocket {
+        to_client: mpsc::Sender<Message>,
+        from_client: mpsc::Receiver<Message>,
+    }
+
+    #[derive(Clone)]
+    struct ScriptedState {
+        sockets: mpsc::Sender<ScriptedSocket>,
+        posts: mpsc::Sender<(String, HashMap<String, String>)>,
+        post_delay: std::time::Duration,
+    }
+
+    struct Scripted {
+        base: String,
+        sockets: mpsc::Receiver<ScriptedSocket>,
+        posts: mpsc::Receiver<(String, HashMap<String, String>)>,
+    }
+
+    async fn scripted_ws(
+        State(state): State<ScriptedState>,
+        upgrade: WebSocketUpgrade,
+    ) -> Response {
+        upgrade.on_upgrade(move |socket| async move {
+            let (mut sink, mut stream) = socket.split();
+            let (to_client, mut outgoing) = mpsc::channel::<Message>(32);
+            let (incoming, from_client) = mpsc::channel::<Message>(64);
+            let _ = state
+                .sockets
+                .send(ScriptedSocket {
+                    to_client,
+                    from_client,
+                })
+                .await;
+            let writer = tokio::spawn(async move {
+                use futures_util::SinkExt;
+                while let Some(message) = outgoing.recv().await {
+                    if sink.send(message).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            while let Some(Ok(message)) = stream.next().await {
+                if incoming.send(message).await.is_err() {
+                    break;
+                }
+            }
+            writer.abort();
+        })
+    }
+
+    async fn scripted_post(
+        State(state): State<ScriptedState>,
+        Path(uid): Path<String>,
+        Form(form): Form<HashMap<String, String>>,
+    ) -> axum::http::StatusCode {
+        tokio::time::sleep(state.post_delay).await;
+        let _ = state.posts.send((uid, form)).await;
+        axum::http::StatusCode::OK
+    }
+
+    async fn big_exporter() -> String {
+        "x".repeat(300 * 1024)
+    }
+
+    async fn quick_exporter() -> &'static str {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        "metric 2\n"
+    }
+
+    async fn start_scripted(post_delay: std::time::Duration) -> Scripted {
+        let (sockets_tx, sockets) = mpsc::channel(4);
+        let (posts_tx, posts) = mpsc::channel(16);
+        let state = ScriptedState {
+            sockets: sockets_tx,
+            posts: posts_tx,
+            post_delay,
+        };
+        let app = Router::new()
+            .route("/proxy/ws/", any(scripted_ws))
+            .route("/proxy/response/{uid}/", post(scripted_post))
+            .route("/metrics", get(quick_exporter))
+            .route("/big", get(big_exporter))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Scripted {
+            base: format!("http://{address}"),
+            sockets,
+            posts,
+        }
+    }
+
+    impl ScriptedSocket {
+        async fn send_json(&self, value: Value) {
+            self.to_client
+                .send(Message::Text(value.to_string().into()))
+                .await
+                .unwrap();
+        }
+
+        /// Next JSON message that is not a heartbeat.
+        async fn next_json(&mut self) -> Value {
+            loop {
+                let message = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    self.from_client.recv(),
+                )
+                .await
+                .expect("timed out waiting for a client message")
+                .expect("client connection ended");
+                if let Message::Text(text) = message {
+                    let value: Value = serde_json::from_str(text.as_str()).unwrap();
+                    if !matches!(value["type"].as_str(), Some("ping" | "pong")) {
+                        return value;
+                    }
+                }
+            }
+        }
+    }
+
+    fn scripted_context(base: &str, protocol: u8, timing: Timing) -> WorkerContext {
+        let mut context = context(base, protocol, false);
+        context.timing = timing;
+        context
+    }
+
+    #[tokio::test]
+    async fn slow_v3_post_is_bounded_and_falls_back_to_websocket() {
+        let mut server = start_scripted(std::time::Duration::from_secs(5)).await;
+        let cancellation = CancellationToken::new();
+        let timing = Timing {
+            post_timeout: std::time::Duration::from_millis(300),
+            ..Timing::default()
+        };
+        let task = tokio::spawn({
+            let context = scripted_context(&server.base, 3, timing);
+            let cancellation = cancellation.clone();
+            async move { run_connection("worker-3", &context, &cancellation).await }
+        });
+        let mut socket = server.sockets.recv().await.unwrap();
+        assert_eq!(socket.next_json().await["type"], "register");
+        socket
+            .send_json(json!({"type":"request","uid":"q1","resource":"node"}))
+            .await;
+        let started = tokio::time::Instant::now();
+        let response = socket.next_json().await;
+        assert_eq!(response["type"], "response");
+        assert_eq!(response["uid"], "q1");
+        assert_eq!(response["body"], "metric 2\n");
+        assert!(started.elapsed() < std::time::Duration::from_millis(1500));
+        cancellation.cancel();
+        task.await.unwrap().unwrap();
+        assert!(server.posts.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn timed_out_large_post_is_not_resent_over_websocket() {
+        let mut server = start_scripted(std::time::Duration::from_secs(30)).await;
+        let cancellation = CancellationToken::new();
+        let timing = Timing {
+            post_timeout: std::time::Duration::from_millis(100),
+            ..Timing::default()
+        };
+        let mut context = scripted_context(&server.base, 3, timing);
+        let mut config = (*context.config).clone();
+        config
+            .resources
+            .insert("big".into(), format!("{}/big", server.base));
+        context.config = Arc::new(config);
+        let task = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move { run_connection("worker-3", &context, &cancellation).await }
+        });
+        let mut socket = server.sockets.recv().await.unwrap();
+        assert_eq!(socket.next_json().await["type"], "register");
+        socket
+            .send_json(json!({"type":"request","uid":"q1","resource":"big"}))
+            .await;
+        // 300 KiB gets about 4.8 seconds before the POST times out.
+        tokio::time::sleep(std::time::Duration::from_millis(5500)).await;
+        socket.send_json(json!({"type":"ready","uid":"r2"})).await;
+        let next = socket.next_json().await;
+        assert_eq!(next, json!({"type":"ready","uid":"r2","worker":"worker-3"}));
+        assert!(server.posts.try_recv().is_err());
+        cancellation.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_close_frame_is_answered_and_is_not_an_error() {
+        let mut server = start_scripted(std::time::Duration::ZERO).await;
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn({
+            let context = context(&server.base, 3, false);
+            let cancellation = cancellation.clone();
+            async move { run_connection("worker-3", &context, &cancellation).await }
+        });
+        let mut socket = server.sockets.recv().await.unwrap();
+        assert_eq!(socket.next_json().await["type"], "register");
+        socket
+            .to_client
+            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: 1001,
+                reason: "worker replaced".into(),
+            })))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client did not end the connection")
+            .unwrap()
+            .unwrap();
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match socket.from_client.recv().await {
+                    Some(Message::Close(frame)) => return frame,
+                    Some(_) => continue,
+                    None => panic!("no close reply"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(reply.map(|frame| frame.code), Some(1001));
+    }
+
+    async fn silent_ws(
+        State(frames): State<mpsc::Sender<Message>>,
+        upgrade: WebSocketUpgrade,
+    ) -> Response {
+        upgrade.on_upgrade(move |mut socket| async move {
+            let _register = socket.next().await;
+            // Neither reading nor writing leaves the client without any
+            // inbound frame, including automatic pongs.
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            while let Some(Ok(message)) = socket.next().await {
+                let closing = matches!(message, Message::Close(_));
+                let _ = frames.send(message).await;
+                if closing {
+                    break;
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn heartbeat_timeout_sends_a_close_frame() {
+        let (frames_tx, mut frames) = mpsc::channel(64);
+        let app = Router::new()
+            .route("/proxy/ws/", any(silent_ws))
+            .with_state(frames_tx);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        // The first heartbeat tick already sees the timeout, so no ping
+        // precedes the close frame; the server's automatic pong to a ping
+        // could hit the closed socket and make the close frame unreadable.
+        let timing = Timing {
+            heartbeat_interval: std::time::Duration::from_millis(100),
+            heartbeat_timeout: std::time::Duration::from_millis(10),
+            ..Timing::default()
+        };
+        let context = scripted_context(&format!("http://{address}"), 3, timing);
+        let result = run_connection("worker-3", &context, &CancellationToken::new()).await;
+        assert!(result.unwrap_err().to_string().contains("heartbeat"));
+
+        let close = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match frames.recv().await {
+                    Some(Message::Close(frame)) => return frame,
+                    Some(_) => continue,
+                    None => panic!("server saw no close frame"),
+                }
+            }
+        })
+        .await
+        .unwrap()
+        .expect("close frame without a reason");
+        assert_eq!(close.code, 1001);
+        assert_eq!(close.reason.as_str(), "heartbeat timeout");
+    }
+
+    #[derive(Default)]
+    struct RecordingSink(Vec<tokio_tungstenite::tungstenite::Message>);
+
+    impl futures_util::Sink<tokio_tungstenite::tungstenite::Message> for RecordingSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            item: tokio_tungstenite::tungstenite::Message,
+        ) -> Result<(), Self::Error> {
+            self.get_mut().0.push(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    fn encoded(budget: &MemoryBudget, uid: &str, body_len: usize) -> super::EncodedResponse {
+        let mut response =
+            BudgetedResponse::try_new(budget, uid.into(), 200, "x".repeat(body_len)).unwrap();
+        super::bounded_response_json(&mut response, budget).unwrap()
+    }
+
+    #[tokio::test]
+    async fn writer_sends_control_frames_before_queued_response_bodies() {
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        let budget = MemoryBudget::new(1024 * 1024);
+        let (control_tx, control_rx) = mpsc::channel(4);
+        let (bulk_tx, bulk_rx) = mpsc::channel(4);
+        bulk_tx.send(encoded(&budget, "b1", 10)).await.unwrap();
+        bulk_tx.send(encoded(&budget, "b2", 10)).await.unwrap();
+        control_tx
+            .send(WsMessage::Text("control".into()))
+            .await
+            .unwrap();
+        drop((control_tx, bulk_tx));
+
+        let mut sink = RecordingSink::default();
+        super::run_writer(
+            &mut sink,
+            control_rx,
+            bulk_rx,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let texts: Vec<_> = sink
+            .0
+            .iter()
+            .map(|message| message.to_text().unwrap().to_owned())
+            .collect();
+        assert_eq!(texts[0], "control");
+        assert!(texts[1].contains("\"b1\"") && texts[2].contains("\"b2\""));
+        assert_eq!(budget.used(), 0);
+    }
+
+    /// Accepts nothing until `open_at`, like a socket whose send buffer is full.
+    struct SlowSink {
+        open_at: std::pin::Pin<Box<tokio::time::Sleep>>,
+    }
+
+    impl SlowSink {
+        fn new(delay: std::time::Duration) -> Self {
+            Self {
+                open_at: Box::pin(tokio::time::sleep(delay)),
+            }
+        }
+    }
+
+    impl futures_util::Sink<tokio_tungstenite::tungstenite::Message> for SlowSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::future::Future::poll(self.get_mut().open_at.as_mut(), context).map(Ok)
+        }
+
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            _item: tokio_tungstenite::tungstenite::Message,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn response_bodies_get_a_size_scaled_send_timeout() {
+        let budget = MemoryBudget::new(1024 * 1024);
+        let send_timeout = std::time::Duration::from_millis(100);
+        let stall = std::time::Duration::from_millis(400);
+
+        let (control_tx, control_rx) = mpsc::channel(1);
+        let (_bulk_tx, bulk_rx) = mpsc::channel::<super::EncodedResponse>(1);
+        control_tx
+            .send(tokio_tungstenite::tungstenite::Message::Text("ping".into()))
+            .await
+            .unwrap();
+        let control_result =
+            super::run_writer(SlowSink::new(stall), control_rx, bulk_rx, send_timeout).await;
+        assert!(
+            control_result.is_err(),
+            "small frames keep the short timeout"
+        );
+
+        let (control_tx, control_rx) = mpsc::channel(1);
+        let (bulk_tx, bulk_rx) = mpsc::channel(1);
+        bulk_tx
+            .send(encoded(&budget, "big", 64 * 1024))
+            .await
+            .unwrap();
+        drop((control_tx, bulk_tx));
+        super::run_writer(SlowSink::new(stall), control_rx, bulk_rx, send_timeout)
+            .await
+            .expect("a 64 KiB body gets about one extra second");
+    }
+
+    #[test]
+    fn bulk_send_timeout_scales_with_size_and_is_capped() {
+        let base = std::time::Duration::from_secs(5);
+        assert_eq!(super::bulk_send_timeout(base, 0), base);
+        assert_eq!(
+            super::bulk_send_timeout(base, 640 * 1024),
+            std::time::Duration::from_secs(15)
+        );
+        assert_eq!(
+            super::bulk_send_timeout(base, 64 * 1024 * 1024),
+            std::time::Duration::from_secs(45)
+        );
+        assert_eq!(
+            super::post_timeout(std::time::Duration::from_secs(10), 640 * 1024),
+            std::time::Duration::from_secs(20)
+        );
+        assert_eq!(
+            super::post_timeout(std::time::Duration::from_secs(10), 64 * 1024 * 1024),
+            std::time::Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn reconnect_delay_backs_off_with_jitter_and_a_cap() {
+        let seconds = |failures, fraction| super::reconnect_delay(failures, fraction).as_secs_f64();
+        assert_eq!(seconds(0, 0.0), 0.5);
+        assert_eq!(seconds(1, 0.0), 0.5);
+        assert!(seconds(1, 0.999) < 1.0);
+        assert_eq!(seconds(2, 0.0), 1.0);
+        assert_eq!(seconds(3, 1.0), 4.0);
+        assert_eq!(seconds(6, 1.0), 30.0);
+        assert_eq!(seconds(60, 0.0), 15.0);
+        for _ in 0..1000 {
+            let fraction = super::random_fraction();
+            assert!((0.0..1.0).contains(&fraction), "{fraction}");
+        }
     }
 
     async fn take_register(events: &mut mpsc::Receiver<Event>) -> Value {
