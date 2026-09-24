@@ -17,7 +17,9 @@ proxy server  <==== WebSocket ====  proxy-client  ---- HTTP ----> exporter
     +--------- WebSocket or HTTP ----------+
 ```
 
-Each worker connection handles one scrape at a time. `--parallel=3` opens three independent worker connections, so a slow exporter cannot create an unbounded queue inside one worker.
+Each worker connection handles one scrape at a time. `--parallel=3` opens three independent worker connections, so a slow exporter cannot create an unbounded queue inside one worker. In wire v3 a worker stays busy until its response POST has finished, which keeps uploads from piling up on a slow link; it ignores `ready` messages meanwhile and another worker takes the scrape.
+
+Every connection has one reader and one writer. Reading never waits for a network write, so server heartbeats, `ready` broadcasts, and close frames are processed while a large response is still uploading. Heartbeats, `ready` answers, and close frames are written before queued response bodies.
 
 ## Compatibility
 
@@ -31,14 +33,14 @@ Product version and wire version are separate concepts. Product v3 supports all 
 
 The Rust v3 server accepts old Python clients and Rust wire v1/v2 clients. This client can connect to the old Python server when configured with its supported wire version. That allows a server-first rollout without changing scrape target syntax.
 
-Wire v3 uses an HTTP response POST and falls back to a WebSocket response when that POST fails or times out. Delivery is therefore transport-level at-least-once: if the POST was applied but its reply was lost, the same UID can be sent again. The Rust server consumes pending UIDs once, and the legacy Python server safely overwrites the same UID result.
+Wire v3 uses an HTTP response POST and falls back to a WebSocket response when that POST fails. The POST gets 10 seconds plus one second per 64 KiB of body, at most 60 seconds. After a timeout only bodies up to 256 KiB are resent over the WebSocket: a slow path would carry a larger body no faster, and the scrape has usually ended by then. Delivery is therefore transport-level at-least-once: if the POST was applied but its reply was lost, the same UID can be sent again. The Rust server consumes pending UIDs once, and the legacy Python server safely overwrites the same UID result.
 
 ## Install a release
 
 Releases contain one stripped, static Linux amd64 binary and its checksum. Pin a version in automation:
 
 ```bash
-VERSION=v3.0.1
+VERSION=v3.0.2
 BASE="https://github.com/razortheory/prometheus-ws-proxy-client/releases/download/${VERSION}"
 curl -fLO "${BASE}/proxy-client-linux-amd64"
 curl -fLO "${BASE}/proxy-client-linux-amd64.sha256"
@@ -117,15 +119,20 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 ```
 
-The client reconnects internally after connection loss and attempts graceful shutdown within 15 seconds.
+The client reconnects internally after connection loss and attempts graceful shutdown within 15 seconds. SIGHUP is logged and ignored, so a unit with `ExecReload=/bin/kill -HUP $MAINPID` no longer terminates the process on `systemctl reload`; configuration is read only at startup, so apply configuration changes with a restart.
 
 ## Resource and failure bounds
 
 - One active exporter scrape per worker connection.
 - 64 MiB maximum exporter body and WebSocket message.
 - Exporter connect timeout: 5 seconds; total request timeout: 60 seconds.
-- Proxy WebSocket connect timeout: 10 seconds; reconnect delay: 1 second.
-- Heartbeat every 20 seconds; stale connection timeout: 45 seconds.
+- Wire-v3 response POST timeout: 10 seconds plus one second per 64 KiB, at most 60 seconds.
+- Busy `503` answers to extra requests: at most 4 concurrent POSTs and 8 queued per connection, with overflow answered over the WebSocket.
+- Proxy WebSocket connect timeout: 10 seconds. Reconnect delay: 0.5 to 1 second after a connection that lived at least a minute; connections that keep failing back off exponentially up to 15 to 30 seconds. The delay is randomized so that a network-wide disconnect does not reconnect every worker in the same instant.
+- Heartbeat every 20 seconds. The connection is closed after 45 seconds without any frame from the server; the server pings every 15 seconds.
+- WebSocket send timeout: 5 seconds for control frames; response bodies get one extra second per 64 KiB, up to 45 seconds (the server's heartbeat timeout), so a large response on a slow link is not cut off.
+- The client sends a close frame with a reason (`heartbeat timeout`, `client shutdown`) when it ends a connection itself, and logs the code and reason when the server closes it (`server closed the connection`). A connection that ends without a close frame was dropped by the network path.
+- TCP_NODELAY is set on the WebSocket connection so small control messages are not delayed on high-latency links.
 - WebSocket writes and fallback response queues are bounded.
 
 Choose `--parallel` from expected scrape concurrency. Adding workers increases concurrency and open sockets; it does not create an unbounded task pool.
