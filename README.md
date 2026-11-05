@@ -40,7 +40,7 @@ Wire v3 uses an HTTP response POST and falls back to a WebSocket response when t
 Releases contain stripped, static Linux amd64 and arm64 binaries, each with its checksum. Pin a version and pick the architecture in automation:
 
 ```bash
-VERSION=v3.0.2
+VERSION=v3.0.3
 ARCH=amd64 # or arm64
 BASE="https://github.com/razortheory/prometheus-ws-proxy-client/releases/download/${VERSION}"
 curl -fLO "${BASE}/proxy-client-linux-${ARCH}"
