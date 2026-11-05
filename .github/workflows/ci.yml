@@ -16,7 +16,6 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
   SCCACHE_GHA_ENABLED: "true"
-  ASSET_NAME: proxy-client-linux-amd64
   BINARY_NAME: proxy-client
 
 jobs:
@@ -62,11 +61,24 @@ jobs:
       - name: Test all targets
         run: cargo +1.88.0 test --locked --all-targets --all-features
 
-  static-amd64:
-    name: Static Linux amd64
+  static-linux:
+    name: Static Linux ${{ matrix.arch }}
     needs: [quality, msrv]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            elf-machine: x86-64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            elf-machine: ARM aarch64
+    env:
+      ASSET_NAME: proxy-client-linux-${{ matrix.arch }}
+      PLATFORM: linux/${{ matrix.arch }}
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -81,20 +93,22 @@ jobs:
       - name: Build static artifact
         run: >-
           docker buildx build
-          --platform linux/amd64
+          --platform "$PLATFORM"
           --target artifact
           --secret id=actions_results_url,env=ACTIONS_RESULTS_URL
           --secret id=actions_runtime_token,env=ACTIONS_RUNTIME_TOKEN
           --output type=local,dest=dist
           .
       - name: Verify artifact
+        env:
+          ELF_MACHINE: ${{ matrix.elf-machine }}
         run: |
           set -euo pipefail
           artifact="dist/${ASSET_NAME}"
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
           description="$(file "$artifact")"
           echo "$description"
-          grep -Eq 'ELF 64-bit.*x86-64' <<<"$description"
+          grep -Eq "ELF 64-bit.*${ELF_MACHINE}" <<<"$description"
           grep -Eq 'statically linked|static-pie linked' <<<"$description"
           grep -q 'stripped' <<<"$description"
           if readelf -l "$artifact" | grep -q 'INTERP'; then
@@ -109,7 +123,7 @@ jobs:
       - name: Smoke test oldest target userspace
         run: |
           set -euo pipefail
-          output="$(docker run --rm --pull=always --platform linux/amd64 \
+          output="$(docker run --rm --pull=always --platform "$PLATFORM" \
             --volume "$PWD/dist/${ASSET_NAME}:/usr/local/bin/${BINARY_NAME}:ro" \
             ubuntu:16.04 "/usr/local/bin/${BINARY_NAME}" --version)"
           echo "$output"

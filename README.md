@@ -37,15 +37,16 @@ Wire v3 uses an HTTP response POST and falls back to a WebSocket response when t
 
 ## Install a release
 
-Releases contain one stripped, static Linux amd64 binary and its checksum. Pin a version in automation:
+Releases contain stripped, static Linux amd64 and arm64 binaries, each with its checksum. Pin a version and pick the architecture in automation:
 
 ```bash
 VERSION=v3.0.2
+ARCH=amd64 # or arm64
 BASE="https://github.com/razortheory/prometheus-ws-proxy-client/releases/download/${VERSION}"
-curl -fLO "${BASE}/proxy-client-linux-amd64"
-curl -fLO "${BASE}/proxy-client-linux-amd64.sha256"
-sha256sum --check proxy-client-linux-amd64.sha256
-sudo install -m 0755 proxy-client-linux-amd64 /usr/local/bin/proxy-client
+curl -fLO "${BASE}/proxy-client-linux-${ARCH}"
+curl -fLO "${BASE}/proxy-client-linux-${ARCH}.sha256"
+sha256sum --check "proxy-client-linux-${ARCH}.sha256"
+sudo install -m 0755 "proxy-client-linux-${ARCH}" /usr/local/bin/proxy-client
 proxy-client --version
 ```
 
@@ -163,12 +164,15 @@ docker buildx build \
   .
 ```
 
+This writes `dist/proxy-client-linux-amd64`. Use `--platform linux/arm64` to
+build `dist/proxy-client-linux-arm64` instead.
+
 The BuildKit secrets are optional when those environment variables are unset.
 Docker builds then fall back to the builder's shared local sccache mount.
 
 ## Releases and Ubuntu support
 
-Pushing a tag such as `v3.0.1` starts the release workflow. The tag must exactly match the Cargo package version. CI builds one static `proxy-client-linux-amd64`, verifies that it has no ELF interpreter or dynamic dependencies, creates a SHA-256 file, and runs that same artifact in Ubuntu 16.04, 18.04, 20.04, 22.04, 24.04, and 26.04 containers before publishing it.
+Pushing a tag such as `v3.0.1` starts the release workflow. The tag must exactly match the Cargo package version. CI builds static `proxy-client-linux-amd64` and `proxy-client-linux-arm64` binaries, verifies that neither has an ELF interpreter or dynamic dependencies, creates a SHA-256 file for each, and runs each artifact in Ubuntu 16.04, 18.04, 20.04, 22.04, 24.04, and 26.04 containers of its architecture before publishing them.
 
 Container smoke tests verify each Ubuntu userspace, not its historical kernel. In particular, Ubuntu 16.04 normally runs kernel 4.4 while GitHub and Docker hosts use a newer kernel. Treat Ubuntu 16 support as provisional until the artifact has also run on a real Ubuntu 16 host or VM.
 

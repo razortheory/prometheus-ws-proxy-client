@@ -18,13 +18,25 @@ env:
   SCCACHE_GHA_ENABLED: "true"
   PACKAGE_NAME: proxy-client
   BINARY_NAME: proxy-client
-  ASSET_NAME: proxy-client-linux-amd64
 
 jobs:
   build:
-    name: Build and verify
-    runs-on: ubuntu-24.04
+    name: Build and verify Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            elf-machine: x86-64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            elf-machine: ARM aarch64
+    env:
+      ASSET_NAME: proxy-client-linux-${{ matrix.arch }}
+      PLATFORM: linux/${{ matrix.arch }}
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -63,20 +75,22 @@ jobs:
       - name: Build static artifact
         run: >-
           docker buildx build
-          --platform linux/amd64
+          --platform "$PLATFORM"
           --target artifact
           --secret id=actions_results_url,env=ACTIONS_RESULTS_URL
           --secret id=actions_runtime_token,env=ACTIONS_RUNTIME_TOKEN
           --output type=local,dest=dist
           .
       - name: Verify artifact and checksum
+        env:
+          ELF_MACHINE: ${{ matrix.elf-machine }}
         run: |
           set -euo pipefail
           artifact="dist/${ASSET_NAME}"
           chmod 0755 "$artifact"
           description="$(file "$artifact")"
           echo "$description"
-          grep -Eq 'ELF 64-bit.*x86-64' <<<"$description"
+          grep -Eq "ELF 64-bit.*${ELF_MACHINE}" <<<"$description"
           grep -Eq 'statically linked|static-pie linked' <<<"$description"
           grep -q 'stripped' <<<"$description"
           if readelf -l "$artifact" | grep -q 'INTERP'; then
@@ -96,7 +110,7 @@ jobs:
       - name: Upload verified release assets
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-assets
+          name: release-assets-${{ matrix.arch }}
           path: |
             dist/${{ env.ASSET_NAME }}
             dist/${{ env.ASSET_NAME }}.sha256
@@ -105,19 +119,28 @@ jobs:
           compression-level: 0
 
   smoke:
-    name: Ubuntu ${{ matrix.ubuntu }} userspace
+    name: Ubuntu ${{ matrix.ubuntu }} ${{ matrix.arch }} userspace
     needs: build
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
+        arch: [amd64, arm64]
         ubuntu: ["16.04", "18.04", "20.04", "22.04", "24.04", "26.04"]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      ASSET_NAME: proxy-client-linux-${{ matrix.arch }}
+      PLATFORM: linux/${{ matrix.arch }}
     steps:
       - name: Download verified release assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: release-assets
+          name: release-assets-${{ matrix.arch }}
           path: dist
       - name: Verify checksum and run binary
         env:
@@ -130,7 +153,7 @@ jobs:
             sha256sum --check "${ASSET_NAME}.sha256"
           )
           chmod 0755 "dist/${ASSET_NAME}"
-          output="$(docker run --rm --pull=always --platform linux/amd64 \
+          output="$(docker run --rm --pull=always --platform "$PLATFORM" \
             --volume "$PWD/dist/${ASSET_NAME}:/usr/local/bin/${BINARY_NAME}:ro" \
             "ubuntu:${UBUNTU_VERSION}" "/usr/local/bin/${BINARY_NAME}" --version)"
           echo "$output"
@@ -147,8 +170,9 @@ jobs:
       - name: Download verified release assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: release-assets
+          pattern: "release-assets-*"
           path: dist
+          merge-multiple: true
       - name: Publish verified release assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -158,11 +182,15 @@ jobs:
           set -euo pipefail
           (
             cd dist
-            sha256sum --check "${ASSET_NAME}.sha256"
+            sha256sum --check \
+              proxy-client-linux-amd64.sha256 \
+              proxy-client-linux-arm64.sha256
           )
           gh release create "$RELEASE_TAG" \
-            "dist/${ASSET_NAME}" \
-            "dist/${ASSET_NAME}.sha256" \
+            dist/proxy-client-linux-amd64 \
+            dist/proxy-client-linux-amd64.sha256 \
+            dist/proxy-client-linux-arm64 \
+            dist/proxy-client-linux-arm64.sha256 \
             --verify-tag \
             --generate-notes \
             --title "$RELEASE_TAG"
